@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     github_token: str = Field(..., alias="GITHUB_TOKEN")
     github_webhook_secret: str = Field(..., alias="GITHUB_WEBHOOK_SECRET")
 
+    # # Database
+    DATABASE_URL: str = Field (..., alias="DATABASE_URL")
+   
     # ============================
     # Pydantic Settings Config
     # ============================
