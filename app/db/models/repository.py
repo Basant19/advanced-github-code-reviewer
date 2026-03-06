@@ -1,115 +1,82 @@
 """
 Repository Model
 
-This module defines the Repository database model used to store
-information about GitHub repositories connected to the platform.
+Defines the SQLAlchemy ORM model for GitHub repositories
+connected to the Advanced GitHub Code Reviewer platform.
 
 Purpose
 -------
-The Repository table enables the system to support multiple
-GitHub repositories and track metadata required for automated
-code reviews.
+The Repository table enables multi-repository support and
+stores metadata required for automated pull request reviews.
 
-Each repository entry represents a GitHub repository that
-the platform monitors for Pull Request events.
+Each record represents a GitHub repository monitored by
+the platform.
 
-Responsibilities
----------------
-1. Store repository identity information.
-2. Maintain repository ownership metadata.
-3. Track repository URL and default branch.
-4. Enable relationship mapping with Pull Requests and Reviews.
-
-Relationships
--------------
-Repository
-    ├── PullRequest
-    │       └── Review
-    │              └── ReviewStep
-    │
-    └── ChatThread (optional future link)
-
-Table Name
-----------
-repositories
-
-Example Record
---------------
-id: 1
-name: advanced-github-code-reviewer
-owner: Basant19
-url: https://github.com/Basant19/advanced-github-code-reviewer
-default_branch: main
-
-Usage
+Table
 -----
-    from app.db.models.repository import Repository
+repositories
 """
 
 from sqlalchemy import Column, Integer, String, DateTime
-from datetime import datetime
-import sys
+from sqlalchemy.sql import func
 
 from app.db.base import Base
-from app.core.logger import get_logger
-from app.core.exceptions import CustomException
-
-
-logger = get_logger(__name__)
 
 
 class Repository(Base):
     """
-    SQLAlchemy ORM model for GitHub repositories.
+    SQLAlchemy ORM model representing a GitHub repository.
 
     Attributes
     ----------
     id : int
-        Primary key for the repository record.
+        Primary key identifier.
 
     name : str
-        Repository name.
+        Name of the repository.
 
     owner : str
-        GitHub repository owner.
+        GitHub username or organization that owns the repository.
 
     url : str
         Full GitHub repository URL.
 
     default_branch : str
-        Default branch of the repository.
+        Default branch used by the repository.
 
     created_at : datetime
-        Timestamp when the repository was registered
-        inside the platform.
+        Timestamp when the repository was added to the system.
+
+    updated_at : datetime
+        Timestamp when repository metadata was last updated.
     """
 
-    try:
-        __tablename__ = "repositories"
+    __tablename__ = "repositories"
 
-        id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True, index=True)
 
-        name = Column(String, nullable=False)
+    name = Column(String(255), nullable=False, index=True)
 
-        owner = Column(String, nullable=False)
+    owner = Column(String(255), nullable=False, index=True)
 
-        url = Column(String, nullable=False, unique=True)
+    url = Column(String(500), nullable=False, unique=True)
 
-        default_branch = Column(String, default="main")
+    default_branch = Column(String(100), default="main")
 
-        created_at = Column(
-            DateTime,
-            default=datetime.utcnow,
-            nullable=False
-        )
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False
+    )
 
-        def __repr__(self):
-            """
-            Return readable string representation of repository.
-            Useful for debugging and logs.
-            """
-            return f"<Repository(name={self.name}, owner={self.owner})>"
+    updated_at = Column(
+        DateTime(timezone=True),
+        onupdate=func.now()
+    )
 
-    except Exception as e:
-        logger.error("Error while defining Repository model")
-        raise CustomException(e, sys)
+    def __repr__(self):
+        """
+        Return readable representation of the repository.
+        Useful for debugging and logging.
+        """
+        return f"<Repository(owner='{self.owner}', name='{self.name}')>"
