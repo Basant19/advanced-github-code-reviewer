@@ -1,7 +1,7 @@
 """
 Pull Request Model
 
-This module defines the SQLAlchemy ORM model for GitHub Pull Requests
+Defines the SQLAlchemy ORM model for GitHub Pull Requests
 tracked by the Advanced GitHub Code Reviewer platform.
 
 Purpose
@@ -24,101 +24,84 @@ Repository
 Table Name
 ----------
 pull_requests
-
-Example Record
---------------
-id: 1
-repo_id: 3
-pr_number: 24
-title: "Fix authentication bug"
-author: "developer123"
-branch: "feature/auth-fix"
-status: "open"
-
-Usage
------
-    from app.db.models.pull_request import PullRequest
 """
+
+import sys
 
 from sqlalchemy import Column, Integer, String, DateTime, ForeignKey
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
 from app.db.base import Base
+from app.core.logger import get_logger
+from app.core.exceptions import CustomException
+
+
+logger = get_logger(__name__)
 
 
 class PullRequest(Base):
     """
     SQLAlchemy ORM model representing a GitHub Pull Request.
-
-    Attributes
-    ----------
-    id : int
-        Primary key identifier.
-
-    repo_id : int
-        Foreign key referencing the repository.
-
-    pr_number : int
-        Pull request number in GitHub.
-
-    title : str
-        Title of the pull request.
-
-    author : str
-        GitHub username who created the PR.
-
-    branch : str
-        Source branch of the pull request.
-
-    status : str
-        Current status of the pull request (open, closed, merged).
-
-    created_at : datetime
-        Timestamp when the PR record was created in the system.
-
-    updated_at : datetime
-        Timestamp when the PR record was last updated.
     """
 
     __tablename__ = "pull_requests"
 
-    id = Column(Integer, primary_key=True, index=True)
+    try:
 
-    repo_id = Column(
-        Integer,
-        ForeignKey("repositories.id"),
-        nullable=False,
-        index=True
-    )
+        id = Column(Integer, primary_key=True, index=True)
 
-    pr_number = Column(Integer, nullable=False)
+        repo_id = Column(
+            Integer,
+            ForeignKey("repositories.id"),
+            nullable=False,
+            index=True
+        )
 
-    title = Column(String(500), nullable=False)
+        pr_number = Column(Integer, nullable=False)
 
-    author = Column(String(255), nullable=False)
+        title = Column(String(500), nullable=False)
 
-    branch = Column(String(255), nullable=False)
+        author = Column(String(255), nullable=False)
 
-    status = Column(String(50), default="open")
+        branch = Column(String(255), nullable=False)
 
-    created_at = Column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        nullable=False
-    )
+        status = Column(String(50), default="open")
 
-    updated_at = Column(
-        DateTime(timezone=True),
-        onupdate=func.now()
-    )
+        created_at = Column(
+            DateTime(timezone=True),
+            server_default=func.now(),
+            nullable=False
+        )
 
-    # Relationship to Repository
-    repository = relationship("Repository", backref="pull_requests")
+        updated_at = Column(
+            DateTime(timezone=True),
+            onupdate=func.now()
+        )
+
+        # Relationship → Repository
+        repository = relationship(
+            "Repository",
+            back_populates="pull_requests"
+        )
+
+        # Relationship → Reviews
+        reviews = relationship(
+            "Review",
+            back_populates="pull_request",
+            cascade="all, delete-orphan"
+        )
+
+        logger.info("PullRequest model initialized successfully")
+
+    except Exception as e:
+        logger.error("Failed to initialize PullRequest model", exc_info=True)
+        raise CustomException(e, sys)
 
     def __repr__(self):
-        """
-        Return readable representation of the pull request.
-        Useful for debugging and logging.
-        """
-        return f"<PullRequest(repo_id={self.repo_id}, pr_number={self.pr_number})>"
+        return (
+            f"<PullRequest("
+            f"repo_id={self.repo_id}, "
+            f"pr_number={self.pr_number}, "
+            f"status={self.status})>"
+        )

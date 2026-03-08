@@ -3,43 +3,6 @@ Message Model
 
 This module defines the SQLAlchemy ORM model responsible for
 storing chat messages within a conversation thread.
-
-Purpose
--------
-The Message table stores individual messages exchanged
-between users and the AI reviewer.
-
-Each message belongs to a Thread and represents a single
-communication unit in a conversation.
-
-This enables the system to support:
-
-• Resume chat functionality
-• AI + human collaboration
-• Review discussions
-• Agent reasoning visibility
-• Conversation history storage
-
-Relationships
--------------
-Thread
-    └── Message
-
-Table Name
-----------
-messages
-
-Example Record
---------------
-id: 10
-thread_id: 3
-role: "user"
-content: "Why did the AI request changes?"
-created_at: "2026-03-07"
-
-Usage
------
-    from app.db.models.message import Message
 """
 
 import sys
@@ -60,28 +23,6 @@ class Message(Base):
     """
     SQLAlchemy ORM model representing a single message
     inside a conversation thread.
-
-    Attributes
-    ----------
-    id : int
-        Primary key identifier for the message.
-
-    thread_id : int
-        Foreign key referencing the associated thread.
-
-    role : str
-        Role of the message sender.
-
-        Possible values:
-        - user
-        - ai
-        - system
-
-    content : str
-        Text content of the message.
-
-    created_at : datetime
-        Timestamp when the message was created.
     """
 
     try:
@@ -120,7 +61,7 @@ class Message(Base):
         # Relationship → Thread
         thread = relationship(
             "Thread",
-            backref="message_list"
+            back_populates="messages"
         )
 
         logger.info("Message model initialized successfully")

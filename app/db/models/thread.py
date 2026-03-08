@@ -123,10 +123,11 @@ class Thread(Base):
 
         # Relationship → Messages (defined later)
         messages = relationship(
-            "Message",
-            backref="thread",
-            cascade="all, delete-orphan"
-        )
+        "Message",
+        back_populates="thread",
+        cascade="all, delete-orphan"
+    )
+
 
         logger.info("Thread model initialized successfully")
 

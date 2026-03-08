@@ -163,8 +163,8 @@ class ReviewStep(Base):
         # Relationship to Review
         review = relationship(
             "Review",
-            backref="steps"
-        )
+            back_populates="steps"
+            )
 
         logger.info("ReviewStep model initialized successfully")
 
