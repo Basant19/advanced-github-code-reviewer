@@ -11,12 +11,6 @@ Responsibilities:
     2. get_review()      — fetch a single review with its steps from DB
     3. list_reviews()    — list all reviews for a repository
 
-DB models used (from Commit 1):
-    Repository   — registered GitHub repos
-    PullRequest  — PR metadata per repo
-    Review       — one review run per PR (status, verdict, summary)
-    ReviewStep   — individual node outputs (fetch, analyze, reflect, verdict)
-
 Flow inside trigger_review():
     ┌─────────────────────────────────────────────────────────┐
     │ 1. get_or_create Repository record                      │
@@ -29,11 +23,8 @@ Flow inside trigger_review():
     └─────────────────────────────────────────────────────────┘
     On any failure → update Review status="failed", re-raise
 
-Status values for Review:
-    "pending"   — not started (reserved for future queuing)
-    "running"   — workflow in progress
-    "completed" — verdict produced and comment posted
-    "failed"    — unrecoverable error occurred
+Status values:
+    "pending" | "running" | "completed" | "failed"
 """
 
 import sys
@@ -58,10 +49,6 @@ logger = get_logger(__name__)
 def _get_or_create_repository(
     db: Session, owner: str, repo: str
 ) -> Repository:
-    """
-    Fetches existing Repository record or creates a new one.
-    Commits the new record so it has a valid ID for FK references.
-    """
     record = (
         db.query(Repository)
         .filter_by(owner=owner, name=repo)
@@ -85,36 +72,31 @@ def _get_or_create_repository(
 
 
 def _get_or_create_pull_request(
-    db: Session,
+    db:         Session,
     repository: Repository,
-    pr_number: int,
-    metadata: dict,
+    pr_number:  int,
+    metadata:   dict,
 ) -> PullRequest:
-    """
-    Fetches existing PullRequest record or creates one from the metadata
-    returned by fetch_diff_node.
-    """
     record = (
         db.query(PullRequest)
         .filter_by(repository_id=repository.id, number=pr_number)
         .first()
     )
     if record:
-        # Update title/state in case they changed
-        record.title  = metadata.get("title",  record.title)
-        record.state  = metadata.get("state",  record.state)
+        record.title = metadata.get("title", record.title)
+        record.state = metadata.get("state", record.state)
         db.commit()
         return record
 
     record = PullRequest(
         repository_id=repository.id,
         number=pr_number,
-        title=metadata.get("title",       ""),
-        author=metadata.get("author",     ""),
+        title=metadata.get("title",             ""),
+        author=metadata.get("author",           ""),
         description=metadata.get("description", ""),
         base_branch=metadata.get("base_branch", ""),
         head_branch=metadata.get("head_branch", ""),
-        state=metadata.get("state",       "open"),
+        state=metadata.get("state",             "open"),
         created_at=datetime.now(timezone.utc),
     )
     db.add(record)
@@ -130,10 +112,6 @@ def _get_or_create_pull_request(
 def _persist_review_steps(
     db: Session, review: Review, final_state: dict
 ) -> None:
-    """
-    Creates one ReviewStep record for each logical stage of the workflow.
-    Steps are named to match the node that produced them.
-    """
     steps = [
         ReviewStep(
             review_id=review.id,
@@ -150,8 +128,8 @@ def _persist_review_steps(
             step_name="analyze_code",
             input_data={"diff_length": len(final_state.get("diff", ""))},
             output_data={
-                "issues":      final_state.get("issues",      []),
-                "suggestions": final_state.get("suggestions", []),
+                "issues":            final_state.get("issues",      []),
+                "suggestions":       final_state.get("suggestions", []),
                 "repo_context_used": bool(final_state.get("repo_context")),
             },
             created_at=datetime.now(timezone.utc),
@@ -161,8 +139,8 @@ def _persist_review_steps(
             step_name="reflect",
             input_data={},
             output_data={
-                "reflection_count": final_state.get("reflection_count", 0),
-                "final_issues":     final_state.get("issues",      []),
+                "reflection_count":  final_state.get("reflection_count", 0),
+                "final_issues":      final_state.get("issues",      []),
                 "final_suggestions": final_state.get("suggestions", []),
             },
             created_at=datetime.now(timezone.utc),
@@ -198,35 +176,15 @@ def trigger_review(
     db:        Session,
 ) -> Review:
     """
-    Runs the complete PR review pipeline:
-        1. Ensures Repository + PullRequest records exist in DB
-        2. Creates a Review record with status="running"
-        3. Executes the LangGraph workflow (all 4 nodes + reflection loop)
-        4. Persists ReviewStep records for each stage
-        5. Updates Review with verdict, summary, status="completed"
-        6. Posts the review summary as a GitHub PR comment
-
-    Args:
-        owner:     GitHub repository owner login
-        repo:      GitHub repository name
-        pr_number: Pull request number to review
-        db:        SQLAlchemy session (injected by FastAPI dependency)
-
-    Returns:
-        The completed Review ORM object.
+    Runs the complete PR review pipeline and returns the completed Review record.
 
     Raises:
-        CustomException on any unrecoverable error. The Review record is
-        updated to status="failed" before the exception propagates.
+        CustomException on any unrecoverable error.
     """
-    logger.info(
-        f"[trigger_review] Starting — {owner}/{repo}#{pr_number}"
-    )
+    logger.info(f"[trigger_review] Starting — {owner}/{repo}#{pr_number}")
 
-    # ── Step 1: ensure repo record exists ────────────────────────────────
     repository = _get_or_create_repository(db, owner, repo)
 
-    # ── Step 2: create review record (status=running) ────────────────────
     review = Review(
         repository_id=repository.id,
         pr_number=pr_number,
@@ -238,27 +196,22 @@ def trigger_review(
     db.refresh(review)
 
     logger.info(
-        f"[trigger_review] Review record created — id={review.id}, "
-        f"status=running"
+        f"[trigger_review] Review record created — id={review.id}, status=running"
     )
 
     try:
-        # ── Step 3: run LangGraph workflow ────────────────────────────────
         final_state = run_review(owner, repo, pr_number)
 
-        # ── Step 4: get_or_create pull request record (needs metadata) ───
         pull_request = _get_or_create_pull_request(
             db, repository, pr_number, final_state.get("metadata", {})
         )
         review.pull_request_id = pull_request.id
 
-        # ── Step 5: persist review steps ─────────────────────────────────
         _persist_review_steps(db, review, final_state)
 
-        # ── Step 6: update review with verdict + summary ──────────────────
-        review.verdict     = final_state.get("verdict", "")
-        review.summary     = final_state.get("summary", "")
-        review.status      = "completed"
+        review.verdict      = final_state.get("verdict", "")
+        review.summary      = final_state.get("summary", "")
+        review.status       = "completed"
         review.completed_at = datetime.now(timezone.utc)
         db.commit()
         db.refresh(review)
@@ -268,7 +221,6 @@ def trigger_review(
             f"id={review.id}, verdict={review.verdict}"
         )
 
-        # ── Step 7: post comment to GitHub ────────────────────────────────
         try:
             github_client = GitHubClient()
             github_client.post_review_comment(
@@ -279,7 +231,6 @@ def trigger_review(
                 f"{owner}/{repo}#{pr_number}"
             )
         except Exception as gh_err:
-            # GitHub comment failure must NOT roll back the completed review
             logger.warning(
                 f"[trigger_review] Failed to post GitHub comment "
                 f"(review still saved): {gh_err}"
@@ -288,17 +239,14 @@ def trigger_review(
         return review
 
     except Exception as e:
-        # Mark review as failed so the caller / UI can surface it
         try:
-            review.status      = "failed"
+            review.status       = "failed"
             review.completed_at = datetime.now(timezone.utc)
             db.commit()
         except Exception:
-            pass   # DB might also be down — best effort
+            pass
 
-        logger.error(
-            f"[trigger_review] Review failed — id={review.id}: {e}"
-        )
+        logger.error(f"[trigger_review] Review failed — id={review.id}: {e}")
 
         if isinstance(e, CustomException):
             raise
@@ -307,17 +255,10 @@ def trigger_review(
 
 def get_review(review_id: int, db: Session) -> Review:
     """
-    Fetches a single Review by ID, including its ReviewStep records.
-
-    Args:
-        review_id: Primary key of the Review record
-        db:        SQLAlchemy session
-
-    Returns:
-        Review ORM object with .steps relationship loaded.
+    Fetches a single Review by ID.
 
     Raises:
-        CustomException if review not found or DB error.
+        CustomException if not found or DB error.
     """
     logger.info(f"[get_review] Fetching review_id={review_id}")
 
@@ -339,18 +280,9 @@ def get_review(review_id: int, db: Session) -> Review:
 
 def list_reviews(owner: str, repo: str, db: Session) -> list[Review]:
     """
-    Lists all Review records for a given repository, ordered by most recent.
+    Lists all Review records for a repository, ordered by most recent.
 
-    Args:
-        owner: GitHub repository owner
-        repo:  GitHub repository name
-        db:    SQLAlchemy session
-
-    Returns:
-        List of Review ORM objects (may be empty).
-
-    Raises:
-        CustomException on DB error.
+    Returns empty list if repo not found — never raises for missing repo.
     """
     logger.info(f"[list_reviews] Fetching reviews for {owner}/{repo}")
 
