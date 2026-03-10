@@ -16,11 +16,19 @@ Every node:
     - Returns a PARTIAL state dict (LangGraph merges it)
     - Is decorated with @traceable so every call appears in LangSmith
     - Logs start / end to the log file
+
+API Key Flow:
+    config.py loads GOOGLE_API_KEY from .env into settings AND os.environ.
+    init_chat_model / init_embeddings read os.environ at invocation time.
+    This survives LangGraph's internal model re-instantiation at runtime.
 """
 
+import os
 import sys
+
 from langsmith import traceable
 from langchain.chat_models import init_chat_model
+from langchain.embeddings import init_embeddings
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from app.graph.state import ReviewState
@@ -31,39 +39,72 @@ from app.core.logger import get_logger
 
 logger = get_logger(__name__)
 
+
+# ── API key validation ────────────────────────────────────────────────────────
+# config.py sets os.environ["GOOGLE_API_KEY"] after loading settings.
+# Verify it landed correctly before initialising the LLM.
+
+_google_api_key = os.environ.get("GOOGLE_API_KEY", "")
+
+if not _google_api_key:
+    logger.error(
+        "[nodes] GOOGLE_API_KEY not found in os.environ — "
+        "check config.py loaded correctly"
+    )
+    raise CustomException("GOOGLE_API_KEY is not set in environment", sys)
+
+logger.info(
+    f"[nodes] GOOGLE_API_KEY received — "
+    f"length={len(_google_api_key)}, "
+    f"prefix={_google_api_key[:6]}..."
+)
+
+
 # ── LLM initialisation ────────────────────────────────────────────────────────
-# init_chat_model auto-detects the provider from the model string.
-# "google_genai" provider is used when model starts with "gemini-".
-# Requires GOOGLE_API_KEY in .env.
+# Uses init_chat_model — provider-agnostic, reads GOOGLE_API_KEY from
+# os.environ. Survives LangGraph's internal re-instantiation at runtime.
 
 llm = init_chat_model(
     model="gemini-2.5-flash",
     model_provider="google_genai",
-    configurable_fields="any",      # allows per-call overrides if needed
+    configurable_fields="any",
 )
 
 logger.info("LLM initialised — gemini-2.5-flash via init_chat_model")
 
 
 # ── ChromaDB long-term memory ─────────────────────────────────────────────────
-# Lazy import: only initialised when the node actually runs.
-# This avoids ChromaDB startup cost during tests.
+# Lazy import — only initialised when the node actually runs.
+# This avoids ChromaDB startup cost during import / tests.
+#
+# Embedding stack:
+#   init_embeddings("google_genai:models/text-embedding-004")
+#       → GoogleGenerativeAIEmbeddings (langchain-google-genai)
+#       → google-genai SDK (not deprecated)
+#   create_langchain_embedding(embedder)
+#       → ChromaDB official bridge — implements full ChromaDB EmbeddingFunction
+#         interface (name, is_legacy, default_space, supported_spaces, etc.)
+#         so no manual adapter or whack-a-mole with new interface methods.
 
 def _get_chroma_collection():
-    """Return (or create) the ChromaDB collection for repository context."""
     import chromadb
-    from chromadb.utils.embedding_functions import GoogleGenerativeAiEmbeddingFunction
+    from chromadb.utils.embedding_functions import ChromaLangchainEmbeddingFunction
+    from langchain_google_genai import GoogleGenerativeAIEmbeddings
+
+    langchain_embedder = GoogleGenerativeAIEmbeddings(
+        model="models/text-embedding-004",
+        google_api_key=settings.google_api_key,
+    )
+
+    embedding_fn = ChromaLangchainEmbeddingFunction(
+        embedding_function=langchain_embedder
+    )
 
     client = chromadb.PersistentClient(path="./chroma_store")
-    embedding_fn = GoogleGenerativeAiEmbeddingFunction(
-        api_key=settings.google_api_key,
-        model_name="models/embedding-001",
-    )
     return client.get_or_create_collection(
         name="repo_context",
         embedding_function=embedding_fn,
     )
-
 
 # ── Node 1: fetch_diff_node ───────────────────────────────────────────────────
 
@@ -137,11 +178,16 @@ def analyze_code_node(state: ReviewState) -> dict:
                 f"{len(docs)} context chunk(s)"
             )
         else:
-            logger.info("[analyze_code_node] No ChromaDB context found — proceeding without it")
+            logger.info(
+                "[analyze_code_node] No ChromaDB context found — "
+                "proceeding without it"
+            )
 
     except Exception as e:
         # Memory failure must never block the review
-        logger.warning(f"[analyze_code_node] ChromaDB query failed (non-fatal): {e}")
+        logger.warning(
+            f"[analyze_code_node] ChromaDB query failed (non-fatal): {e}"
+        )
         repo_context = ""
 
     # ── Step 2: build prompt ─────────────────────────────────────────────
@@ -239,13 +285,12 @@ def reflect_node(state: ReviewState) -> dict:
 
     Runs up to 2 times (controlled by reflection_count in workflow.py).
 
-    Reads  : state["issues"], state["suggestions"], state["diff"], state["reflection_count"]
+    Reads  : state["issues"], state["suggestions"], state["diff"],
+             state["reflection_count"]
     Writes : state["issues"], state["suggestions"], state["reflection_count"]
     """
     current_count = state["reflection_count"]
-    logger.info(
-        f"[reflect_node] Reflection pass #{current_count + 1} starting"
-    )
+    logger.info(f"[reflect_node] Reflection pass #{current_count + 1} starting")
 
     existing_issues      = state["issues"]
     existing_suggestions = state["suggestions"]
@@ -285,7 +330,9 @@ SUGGESTIONS:
     new_issues, new_suggestions = _parse_llm_output(raw_output)
 
     # Merge — deduplicate by lowercased content
-    merged_issues = list({i.lower(): i for i in existing_issues + new_issues}.values())
+    merged_issues = list(
+        {i.lower(): i for i in existing_issues + new_issues}.values()
+    )
     merged_suggestions = list(
         {s.lower(): s for s in existing_suggestions + new_suggestions}.values()
     )
@@ -325,7 +372,6 @@ def verdict_node(state: ReviewState) -> dict:
     # Simple deterministic rule: any issues → REQUEST_CHANGES
     verdict = "REQUEST_CHANGES" if issues else "APPROVE"
 
-    # ── format the GitHub comment ────────────────────────────────────────
     verdict_emoji = "✅" if verdict == "APPROVE" else "🔴"
 
     issues_section = (

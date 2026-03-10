@@ -39,6 +39,7 @@ Thumbs.db
 
 # Chroma local storage
 chroma/
+chroma_store/
 
 # Pytest
 .pytest_cache/
