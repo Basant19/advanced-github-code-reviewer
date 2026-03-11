@@ -1,0 +1,153 @@
+# =============================================================================
+# Advanced GitHub Code Reviewer — .dockerignore
+# =============================================================================
+#
+# PURPOSE
+# -------
+# This file controls what Docker EXCLUDES from the build context when running:
+#   docker build -f Dockerfile .            (P6 — FastAPI app image)
+#
+# It does NOT apply to docker/sandbox/Dockerfile because that Dockerfile
+# copies nothing from the project — it only installs pip packages.
+#
+# WHY THIS MATTERS
+# ----------------
+# Without .dockerignore, Docker sends your ENTIRE project directory to the
+# Docker daemon as the build context — including .env (real credentials),
+# chroma_store/ (gigabytes of vector data), logs/, and node_modules/.
+#
+# This causes two problems:
+#   1. SECURITY: .env with real API keys could end up baked into the image
+#      and pushed to a container registry (ECR, Docker Hub)
+#   2. SPEED: build context balloons from ~10MB to potentially hundreds of MB,
+#      making every `docker build` slow unnecessarily
+#
+# RULE: If it contains secrets or generated data, exclude it.
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# SECRETS — Never in a Docker image under any circumstances
+# -----------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+
+# -----------------------------------------------------------------------------
+# Python cache — generated at runtime, not needed in image
+# -----------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+*.so
+
+
+# -----------------------------------------------------------------------------
+# Virtual environments — image uses its own pip install
+# -----------------------------------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+.virtualenv/
+
+
+# -----------------------------------------------------------------------------
+# Vector database storage — large, regenerated from source repos
+# -----------------------------------------------------------------------------
+chroma_store/
+
+
+# -----------------------------------------------------------------------------
+# Log files — generated at runtime, not needed in image
+# -----------------------------------------------------------------------------
+logs/
+*.log
+
+
+# -----------------------------------------------------------------------------
+# Test suite — not needed in production image
+# Tests run in CI/CD pipeline, not inside the deployed container
+# -----------------------------------------------------------------------------
+test/
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+
+# -----------------------------------------------------------------------------
+# Development and editor files
+# -----------------------------------------------------------------------------
+.git/
+.gitignore
+.gitattributes
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+
+# -----------------------------------------------------------------------------
+# Node / JavaScript — used for document generation scripts only
+# Not needed in the Python application image
+# -----------------------------------------------------------------------------
+node_modules/
+*.js
+package.json
+package-lock.json
+
+
+# -----------------------------------------------------------------------------
+# Docker files themselves — no need to copy into the image
+# -----------------------------------------------------------------------------
+Dockerfile
+docker/
+.dockerignore
+docker-compose.yml
+docker-compose.*.yml
+
+
+# -----------------------------------------------------------------------------
+# Documentation — not needed in production image
+# -----------------------------------------------------------------------------
+*.md
+!README.md
+docs/
+*.docx
+*.pdf
+
+
+# -----------------------------------------------------------------------------
+# Database reset script — destructive, not for production
+# -----------------------------------------------------------------------------
+reset_db.py
+
+
+# -----------------------------------------------------------------------------
+# OS and temp files
+# -----------------------------------------------------------------------------
+*.tmp
+*.bak
+*.orig
+tmp/
+temp/
+
+
+# =============================================================================
+# WHAT IS INCLUDED (everything not listed above)
+# =============================================================================
+# app/              ← FastAPI application code
+# schemas/          ← Pydantic schemas
+# pyproject.toml    ← dependency definitions
+# .env.example      ← template only, no real credentials
+#
+# RESULT: clean ~10MB build context, zero secrets, fast builds
+# =============================================================================
