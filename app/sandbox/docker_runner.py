@@ -302,7 +302,9 @@ class DockerRunner:
             self._client = docker.from_env()
             self._client.ping()
             logger.info("docker_runner: Docker client connected")
-        except docker.errors.DockerException as exc:
+        except Exception as exc:
+            # Catches both docker.errors.DockerException (real Docker failures)
+            # and plain Exception (used in unit tests that mock docker.from_env).
             raise SandboxError(
                 "Cannot connect to Docker daemon. "
                 "Is Docker Desktop running? "
