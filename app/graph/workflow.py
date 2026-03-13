@@ -1,257 +1,179 @@
 """
-app/graph/workflow.py
+E:\advanced-github-code-reviewer\app\graph\workflow.py
 
-LangGraph Review Workflow
---------------------------
-Wires all nodes into a compiled StateGraph with:
-    - A sandbox validation loop (refactor_node → validator_node, up to 3×)
-    - MemorySaver checkpointing (durable execution / resume on crash)
-    - A single public entry point: run_review()
+LangGraph workflow definition for Advanced GitHub Code Reviewer.
 
-P2 Graph structure:
+P1: fetch_diff → analyze_code → reflect (×2 via should_reflect) → verdict → END
+P2: rewired to add lint → refactor → validator → should_refactor loop (max 3×)
+P3: adds interrupt() call before verdict_node — graph suspends and awaits human
+    approval via POST /reviews/{id}/approve or POST /reviews/{id}/reject.
+
+Graph structure (P3):
     START
-      ↓
-    fetch_diff_node
-      ↓
-    analyze_code_node
-      ↓
-    lint_node
-      ↓
-    refactor_node  ←─────────────────────────┐
-      ↓                                       │
-    validator_node                            │
-      ↓                                       │
-    should_refactor()                         │
-      ├── "refactor_node"  ──────────────────┘  (not passed AND count < MAX)
-      └── "verdict_node"                         (passed OR count >= MAX)
-            ↓
-          verdict_node
-            ↓
-           END
-
-P1 Graph (preserved for reference — reflects_node + should_reflect still
-in this file so existing tests continue to pass):
-    START → fetch_diff → analyze → reflect(×2) → verdict → END
-
-MAX_REFACTOR_ITERATIONS: 3
-    After 3 attempts the workflow exits to verdict_node regardless of
-    whether the patch passes. The PR comment will show failed sandbox
-    results — the human reviewer sees exactly why it did not pass.
-
-Usage:
-    from app.graph.workflow import run_review
-
-    result = run_review(
-        owner="Basant19",
-        repo="python_tuts",
-        pr_number=1,
-    )
-    print(result["verdict"])   # "APPROVE" or "REQUEST_CHANGES"
-    print(result["summary"])   # full review comment ready to post to GitHub
+      → fetch_diff_node
+      → analyze_code_node
+      → reflect_node          ← loops via should_reflect() up to 2×
+      → lint_node
+      → refactor_node
+      → validator_node        ← loops via should_refactor() up to 3×
+      → [interrupt()]         ★ P3: graph pauses here, human decision required
+      → verdict_node
+      → END
 """
 
-import sys
-
-from langgraph.graph import StateGraph, START, END
+from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import interrupt
 
-from app.graph.state import ReviewState, build_initial_state
+from app.graph.state import ReviewState
 from app.graph.nodes import (
     fetch_diff_node,
     analyze_code_node,
-    reflect_node,       # kept — used by P1 tests
+    reflect_node,
     lint_node,
     refactor_node,
     validator_node,
     verdict_node,
 )
-from app.core.exceptions import CustomException
 from app.core.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Maximum refactor → validate iterations before forcing verdict
-MAX_REFACTOR_ITERATIONS = 3
-
-
-# ── P1 conditional edge (kept — P1 tests import this) ────────────────────────
+# ── Conditional edge helpers ─────────────────────────────────────────────────
 
 def should_reflect(state: ReviewState) -> str:
     """
-    P1 conditional edge — kept so existing tests do not break.
-    Not used in the P2 graph.
-
-    Returns "reflect_node" if reflection_count < 2, else "verdict_node".
+    Controls the self-reflection loop after analyze_code_node.
+    Reflects up to 2 times (reflection_count starts at 0 in P1 loop).
+    Returns node name to route to next.
     """
-    if state["reflection_count"] < 2:
-        logger.info(
-            f"[should_reflect] count={state['reflection_count']} — looping"
-        )
+    count = state.get("reflection_count", 0)
+    if count < 2:
+        logger.debug("should_reflect → reflect_node (count=%d)", count)
         return "reflect_node"
+    logger.debug("should_reflect → lint_node (count=%d, exiting reflect loop)", count)
+    return "lint_node"
 
-    logger.info(
-        f"[should_reflect] count={state['reflection_count']} — to verdict"
-    )
-    return "verdict_node"
-
-
-# ── P2 conditional edge ───────────────────────────────────────────────────────
 
 def should_refactor(state: ReviewState) -> str:
     """
-    Decides whether to loop back to refactor_node or proceed to verdict.
-
-    Called by LangGraph after every validator_node execution.
-
-    Logic:
-      - If validation passed → verdict_node (code is clean)
-      - If reflection_count >= MAX → verdict_node (max attempts reached)
-      - Otherwise → refactor_node (try again)
-
-    Returns:
-        "verdict_node"  — proceed to final verdict
-        "refactor_node" — loop back and try again
+    Controls the refactor/validate loop after validator_node.
+    - validation passed        → proceed to hitl_node (P3 interrupt gate)
+    - validation failed + < 3  → loop back to refactor_node
+    - reflection_count >= 3    → proceed regardless (max iterations reached)
     """
-    validation_result = state.get("validation_result")
-    reflection_count  = state["reflection_count"]
+    validation_result = state.get("validation_result", {})
+    reflection_count = state.get("reflection_count", 0)
 
-    # Validation passed — code is clean, move to verdict
-    if validation_result and validation_result.passed:
-        logger.info(
-            f"[should_refactor] Validation PASSED at iteration "
-            f"{reflection_count} — proceeding to verdict"
+    if validation_result.get("passed", False):
+        logger.debug("should_refactor → hitl_node (validation passed)")
+        return "hitl_node"
+
+    if reflection_count < 3:
+        logger.debug(
+            "should_refactor → refactor_node (validation failed, count=%d)",
+            reflection_count,
         )
-        return "verdict_node"
+        return "refactor_node"
 
-    # Max iterations reached — exit loop regardless of result
-    if reflection_count >= MAX_REFACTOR_ITERATIONS:
-        logger.info(
-            f"[should_refactor] Max iterations ({MAX_REFACTOR_ITERATIONS}) "
-            f"reached — proceeding to verdict with failed sandbox results"
-        )
-        return "verdict_node"
-
-    # Still failing — loop back for another refactor attempt
-    logger.info(
-        f"[should_refactor] Validation FAILED — "
-        f"iteration={reflection_count}, max={MAX_REFACTOR_ITERATIONS} — "
-        f"looping back to refactor_node"
+    logger.debug(
+        "should_refactor → hitl_node (max iterations reached, count=%d)",
+        reflection_count,
     )
-    return "refactor_node"
+    return "hitl_node"
 
 
-# ── Graph construction ────────────────────────────────────────────────────────
+# ── P3: HITL interrupt node ──────────────────────────────────────────────────
 
-def build_graph() -> StateGraph:
+def hitl_node(state: ReviewState) -> dict:
     """
-    Constructs and compiles the P2 LangGraph StateGraph.
+    Human-in-the-Loop gate (P3).
 
-    P2 graph: fetch_diff → analyze → lint → refactor → validate(loop) → verdict
+    Calls LangGraph interrupt() which immediately suspends graph execution.
+    The graph thread is checkpointed at this point.
 
-    Uses MemorySaver as the checkpointer so execution state survives
-    process restarts. Each review uses thread_id as its checkpoint key.
+    Resumption happens when an admin calls:
+        POST /reviews/{id}/approve   → human_decision = 'approved'
+        POST /reviews/{id}/reject    → human_decision = 'rejected'
+
+    The FastAPI HITL routes resume the graph by invoking it again with the
+    same thread_id and injecting human_decision into state.
+
+    Returns an empty dict — state is not modified here; the decision value
+    is injected externally on resume via Command(resume=...) or state update.
+    """
+    logger.info(
+        "hitl_node: suspending graph — awaiting human approval for PR #%s",
+        state.get("pr_number"),
+    )
+    # interrupt() raises a special LangGraph signal that checkpoints the graph.
+    # Execution resumes from this exact point when the thread is re-invoked.
+    interrupt("Awaiting human approval. Call /approve or /reject to continue.")
+    return {}
+
+
+# ── Build graph ──────────────────────────────────────────────────────────────
+
+def build_graph():
+    """
+    Construct and compile the P3 LangGraph StateGraph.
+
+    MemorySaver is required for interrupt() — it checkpoints state so the
+    graph can resume from the exact suspended node.
 
     Returns:
-        A compiled LangGraph application ready to invoke.
+        Compiled LangGraph application with memory checkpointing enabled.
     """
-    logger.info("Building P2 LangGraph review workflow")
-
     builder = StateGraph(ReviewState)
 
-    # ── Register all nodes ────────────────────────────────────────────────
-    builder.add_node("fetch_diff_node",   fetch_diff_node)
+    # ── Register all nodes ───────────────────────────────────────────────────
+    builder.add_node("fetch_diff_node", fetch_diff_node)
     builder.add_node("analyze_code_node", analyze_code_node)
-    builder.add_node("lint_node",         lint_node)
-    builder.add_node("refactor_node",     refactor_node)
-    builder.add_node("validator_node",    validator_node)
-    builder.add_node("verdict_node",      verdict_node)
+    builder.add_node("reflect_node", reflect_node)
+    builder.add_node("lint_node", lint_node)
+    builder.add_node("refactor_node", refactor_node)
+    builder.add_node("validator_node", validator_node)
+    builder.add_node("hitl_node", hitl_node)       # ★ P3
+    builder.add_node("verdict_node", verdict_node)
 
-    # ── Static edges ──────────────────────────────────────────────────────
-    # These always follow in this direction — no branching
-    builder.add_edge(START,                "fetch_diff_node")
-    builder.add_edge("fetch_diff_node",    "analyze_code_node")
-    builder.add_edge("analyze_code_node",  "lint_node")
-    builder.add_edge("lint_node",          "refactor_node")
-    builder.add_edge("verdict_node",       END)
+    # ── Entry point ──────────────────────────────────────────────────────────
+    builder.set_entry_point("fetch_diff_node")
 
-    # ── Conditional edge: sandbox validation loop ─────────────────────────
-    # After validator_node, call should_refactor() to decide next node.
-    # Two possible targets: loop back to refactor_node or exit to verdict.
+    # ── Linear edges ────────────────────────────────────────────────────────
+    builder.add_edge("fetch_diff_node", "analyze_code_node")
+
+    # ── Reflection loop: analyze → reflect (×2) → lint ──────────────────────
+    builder.add_conditional_edges(
+        "analyze_code_node",
+        should_reflect,
+        {"reflect_node": "reflect_node", "lint_node": "lint_node"},
+    )
+    builder.add_conditional_edges(
+        "reflect_node",
+        should_reflect,
+        {"reflect_node": "reflect_node", "lint_node": "lint_node"},
+    )
+
+    # ── Refactor loop: lint → refactor → validator → [loop | hitl] ──────────
+    builder.add_edge("lint_node", "refactor_node")
+    builder.add_edge("refactor_node", "validator_node")
     builder.add_conditional_edges(
         "validator_node",
         should_refactor,
-        {
-            "refactor_node": "refactor_node",  # loop — try another patch
-            "verdict_node":  "verdict_node",   # exit — passed or max reached
-        },
+        {"refactor_node": "refactor_node", "hitl_node": "hitl_node"},
     )
 
-    # ── Compile with MemorySaver ──────────────────────────────────────────
-    memory = MemorySaver()
-    graph  = builder.compile(checkpointer=memory)
+    # ── HITL → verdict → END ─────────────────────────────────────────────────
+    builder.add_edge("hitl_node", "verdict_node")
+    builder.add_edge("verdict_node", END)
 
-    logger.info("P2 LangGraph review workflow compiled successfully")
+    # ── Compile with MemorySaver (required for interrupt()) ──────────────────
+    memory = MemorySaver()
+    graph = builder.compile(checkpointer=memory)
+
+    logger.info("P3 graph compiled with MemorySaver and interrupt() gate")
     return graph
 
 
-# ── Singleton graph instance ──────────────────────────────────────────────────
-# Built once at module import time. Reused for every review.
-
-try:
-    review_graph = build_graph()
-    logger.info("review_graph ready")
-except Exception as e:
-    logger.error(f"Failed to build review_graph: {e}")
-    raise CustomException(str(e), sys)
-
-
-# ── Public entry point ────────────────────────────────────────────────────────
-
-def run_review(owner: str, repo: str, pr_number: int) -> ReviewState:
-    """
-    Runs the full P2 PR review workflow for a given pull request.
-
-    Called by review_service.py. Returns the final ReviewState with
-    verdict and summary populated.
-
-    Args:
-        owner:     GitHub repository owner login
-        repo:      GitHub repository name
-        pr_number: Pull request number to review
-
-    Returns:
-        Final ReviewState — verdict, summary, lint_result,
-        validation_result all populated.
-
-    Raises:
-        CustomException on any unrecoverable workflow error.
-    """
-    logger.info(f"[run_review] Starting — {owner}/{repo}#{pr_number}")
-
-    try:
-        initial_state = build_initial_state(owner, repo, pr_number)
-
-        config = {
-            "configurable": {
-                "thread_id": f"{owner}-{repo}-{pr_number}"
-            }
-        }
-
-        final_state = review_graph.invoke(initial_state, config=config)
-
-        logger.info(
-            f"[run_review] Completed — "
-            f"verdict={final_state.get('verdict')} "
-            f"issues={len(final_state.get('issues', []))} "
-            f"lint_passed={final_state.get('lint_passed')} "
-            f"validation_passed="
-            f"{final_state.get('validation_result') and final_state['validation_result'].passed}"
-        )
-        return final_state
-
-    except CustomException:
-        raise  # already logged inside the node that raised it
-
-    except Exception as e:
-        logger.error(f"[run_review] Unexpected error: {e}")
-        raise CustomException(str(e), sys)
+# ── Module-level graph instance (imported by services) ──────────────────────
+review_graph = build_graph()

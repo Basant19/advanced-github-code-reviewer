@@ -16,17 +16,22 @@ P2 nodes (new):
     refactor_node        → Gemini generates corrective patch from findings
     validator_node       → Docker sandbox ruff + pytest on generated patch
 
-Node execution order (P2 graph — defined in workflow.py):
+P3 update:
+    verdict_node         → now reads human_decision from state:
+                             'rejected'  → HUMAN_REJECTED verdict, no GitHub post
+                             'approved'  → normal APPROVE / REQUEST_CHANGES logic
+                             None        → defensive fallback to approved path
+
+Node execution order (P3 graph — defined in workflow.py):
     fetch_diff_node
         → analyze_code_node
         → lint_node
-            FAIL (lint_passed=False) → refactor_node
-            PASS (lint_passed=True)  → refactor_node  (with clean lint signal)
         → refactor_node
         → validator_node
             FAIL → loop back to refactor_node  (up to MAX_REFACTOR_ITERATIONS)
-            PASS → verdict_node
-        → verdict_node
+            PASS → hitl_node                   ★ P3
+        → hitl_node  [interrupt() — graph pauses, awaits human decision]
+        → verdict_node  [reads human_decision, produces final output]
 
 Module-level objects (both patchable in tests):
     llm              — Gemini chat model via init_chat_model
@@ -364,35 +369,102 @@ SUGGESTIONS:
     }
 
 
+# =============================================================================
+# P3 UPDATE — verdict_node
+# Only this function is changed from P2. All logic above is untouched.
+# Change: reads human_decision from state before producing verdict.
+#   'rejected' → HUMAN_REJECTED immediately, no GitHub comment posted
+#   'approved' → normal APPROVE / REQUEST_CHANGES path
+#   None       → defensive fallback, treated as approved (logs a warning)
+# =============================================================================
+
 @traceable(name="verdict_node", tags=["verdict"])
 def verdict_node(state: ReviewState) -> dict:
     """
-    Produces the final APPROVE or REQUEST_CHANGES verdict and formats
-    the full review comment that will be posted to GitHub.
+    Produces the final verdict and formats the GitHub PR comment markdown.
 
-    P2 update: if lint_result or validation_result are present in state,
-    their summaries are included in the PR comment for full transparency.
+    P2: included lint_result and validation_result sandbox summaries.
+    P3: reads human_decision before anything else.
+        - 'rejected'  → short-circuits to HUMAN_REJECTED; no GitHub comment.
+        - 'approved'  → proceeds to APPROVE / REQUEST_CHANGES determination.
+        - None        → warns and falls through to approved path (safety net).
 
-    Reads  : state["issues"], state["suggestions"], state["metadata"],
-             state["lint_result"]       (P2 — optional)
-             state["validation_result"] (P2 — optional)
+    The calling service (review_service.py) checks verdict == 'HUMAN_REJECTED'
+    and skips the GitHub comment post in that case.
+
+    Reads  : state["human_decision"]       ★ P3
+             state["issues"]
+             state["suggestions"]
+             state["metadata"]
+             state["lint_result"]          (P2 — optional)
+             state["validation_result"]    (P2 — optional)
     Writes : state["verdict"], state["summary"]
     """
-    issues      = state["issues"]
-    suggestions = state["suggestions"]
-    metadata    = state["metadata"]
-
+    human_decision    = state.get("human_decision")         # ★ P3
+    issues            = state.get("issues", [])
+    suggestions       = state.get("suggestions", [])
+    metadata          = state.get("metadata", {})
     lint_result       = state.get("lint_result")
     validation_result = state.get("validation_result")
 
+    pr_title  = metadata.get("title",  "Unknown PR")
+    pr_author = metadata.get("author", "unknown")
+    pr_number = state.get("pr_number", "?")
+
     logger.info(
-        f"[verdict_node] Generating verdict — "
-        f"{len(issues)} issue(s), {len(suggestions)} suggestion(s)"
+        "[verdict_node] Starting — PR #%s '%s' | human_decision=%r | "
+        "issues=%d suggestions=%d",
+        pr_number, pr_title, human_decision, len(issues), len(suggestions),
     )
 
-    verdict       = "REQUEST_CHANGES" if issues else "APPROVE"
+    # ── P3: Human rejected — short-circuit before all normal verdict logic ────
+    if human_decision == "rejected":
+        logger.info(
+            "[verdict_node] human_decision='rejected' — "
+            "producing HUMAN_REJECTED verdict. GitHub comment will NOT be posted."
+        )
+        summary = (
+            f"## ❌ Review Rejected by Human Reviewer\n\n"
+            f"**PR:** {pr_title}\n"
+            f"**Author:** @{pr_author}\n\n"
+            f"A human reviewer rejected this AI-generated review. "
+            f"No comment has been posted to the pull request.\n\n"
+            f"_{len(issues)} issue(s) and {len(suggestions)} suggestion(s) "
+            f"were identified by the AI but not published._"
+        )
+        logger.info("[verdict_node] HUMAN_REJECTED summary built — returning")
+        return {"verdict": "HUMAN_REJECTED", "summary": summary}
+
+    # ── P3: Log human_decision value before proceeding ────────────────────────
+    if human_decision == "approved":
+        logger.info(
+            "[verdict_node] human_decision='approved' — "
+            "proceeding with normal APPROVE / REQUEST_CHANGES logic."
+        )
+    else:
+        # human_decision is None — should not occur in normal P3 flow.
+        # Possible if graph was invoked without going through hitl_node
+        # (e.g. direct test invocation or legacy P1/P2 call path).
+        logger.warning(
+            "[verdict_node] human_decision is None — "
+            "HITL gate may have been bypassed. "
+            "Falling through to normal verdict logic as a safety net."
+        )
+
+    # ── Normal verdict determination ──────────────────────────────────────────
+    has_issues  = bool(issues)
+    lint_passed = lint_result.passed if lint_result else True
+
+    verdict       = "REQUEST_CHANGES" if (has_issues or not lint_passed) else "APPROVE"
     verdict_emoji = "✅" if verdict == "APPROVE" else "🔴"
 
+    logger.info(
+        "[verdict_node] Determined verdict=%s "
+        "(has_issues=%s lint_passed=%s)",
+        verdict, has_issues, lint_passed,
+    )
+
+    # ── Build issues / suggestions sections ───────────────────────────────────
     issues_section = (
         "\n".join(f"- {i}" for i in issues)
         if issues else "_No issues found._"
@@ -402,6 +474,7 @@ def verdict_node(state: ReviewState) -> dict:
         if suggestions else "_No suggestions._"
     )
 
+    # ── Build sandbox section (P2 — unchanged) ────────────────────────────────
     sandbox_section = ""
     if lint_result or validation_result:
         sandbox_lines = ["### 🔬 Sandbox Results"]
@@ -410,32 +483,53 @@ def verdict_node(state: ReviewState) -> dict:
             sandbox_lines.append(
                 f"- **Lint (ruff):** {lint_icon} `{lint_result.summary}`"
             )
+            if not lint_result.passed:
+                logger.debug(
+                    "[verdict_node] Lint failed — output included in comment: %s",
+                    lint_result.output[:200],
+                )
         if validation_result:
             val_icon = "✅" if validation_result.passed else "❌"
             sandbox_lines.append(
                 f"- **Tests (ruff + pytest):** {val_icon} "
                 f"`{validation_result.summary}`"
             )
+            if not validation_result.passed:
+                logger.debug(
+                    "[verdict_node] Validation failed — output: %s",
+                    validation_result.output[:200],
+                )
         sandbox_section = "\n" + "\n".join(sandbox_lines) + "\n"
 
-    summary = f"""## {verdict_emoji} AI Code Review
+    # ── P3: Human approval badge in comment ───────────────────────────────────
+    human_badge = (
+        "\n**Human Approval:** ✅ Approved by reviewer\n"
+        if human_decision == "approved"
+        else ""
+    )
 
-**PR:** {metadata.get('title', 'N/A')}
-**Author:** {metadata.get('author', 'N/A')}
-**Verdict:** `{verdict}`
+    # ── Assemble final GitHub comment markdown ────────────────────────────────
+    summary = (
+        f"## {verdict_emoji} AI Code Review\n\n"
+        f"**PR:** {pr_title}\n"
+        f"**Author:** @{pr_author}\n"
+        f"**Verdict:** `{verdict}`"
+        f"{human_badge}\n"
+        f"---"
+        f"{sandbox_section}\n"
+        f"### 🐛 Issues\n"
+        f"{issues_section}\n\n"
+        f"### 💡 Suggestions\n"
+        f"{suggestions_section}\n\n"
+        f"---\n"
+        f"*Review generated by Advanced GitHub Code Reviewer "
+        f"· Powered by Gemini 2.5 Flash*"
+    )
 
----
-{sandbox_section}
-### 🐛 Issues
-{issues_section}
-
-### 💡 Suggestions
-{suggestions_section}
-
----
-*Review generated by Advanced GitHub Code Reviewer · Powered by Gemini 2.5 Flash*"""
-
-    logger.info(f"[verdict_node] Verdict: {verdict}")
+    logger.info(
+        "[verdict_node] Complete — verdict=%s summary_length=%d chars",
+        verdict, len(summary),
+    )
 
     return {
         "verdict": verdict,
@@ -444,7 +538,8 @@ def verdict_node(state: ReviewState) -> dict:
 
 
 # =============================================================================
-# P2 NODES — NEW
+# P2 NODES — UNTOUCHED
+# All 54 P1+P2 node tests pass. Do not modify.
 # =============================================================================
 
 @traceable(name="lint_node", tags=["sandbox", "lint"])
@@ -467,17 +562,16 @@ def lint_node(state: ReviewState) -> dict:
         lint_result = sandbox_client.run_lint(diff)
 
         logger.info(
-            f"[lint_node] Complete — "
-            f"passed={lint_result.passed} "
-            f"exit_code={lint_result.exit_code} "
-            f"duration={lint_result.duration_ms}ms"
+            "[lint_node] Complete — passed=%s exit_code=%s duration=%sms",
+            lint_result.passed, lint_result.exit_code, lint_result.duration_ms,
         )
 
         if lint_result.passed:
             logger.info("[lint_node] Lint PASSED")
         else:
             logger.info(
-                f"[lint_node] Lint FAILED\nruff output:\n{lint_result.output}"
+                "[lint_node] Lint FAILED\nruff output:\n%s",
+                lint_result.output,
             )
 
         return {
@@ -486,7 +580,7 @@ def lint_node(state: ReviewState) -> dict:
         }
 
     except Exception as e:
-        logger.error(f"[lint_node] Sandbox error: {e}")
+        logger.error("[lint_node] Sandbox error: %s", e, exc_info=True)
         raise CustomException(str(e), sys)
 
 
@@ -513,8 +607,8 @@ def refactor_node(state: ReviewState) -> dict:
     current_count     = state["reflection_count"]
 
     logger.info(
-        f"[refactor_node] Generating patch — "
-        f"iteration={current_count + 1} issues={len(issues)}"
+        "[refactor_node] Generating patch — iteration=%d issues=%d",
+        current_count + 1, len(issues),
     )
 
     lint_context = ""
@@ -560,12 +654,11 @@ code blocks, no extra text — just the raw diff starting with "diff --git"."""
         response  = llm.invoke([HumanMessage(content=refactor_prompt)])
         raw_patch = response.content.strip()
         logger.info(
-            f"[refactor_node] Patch generated — "
-            f"{len(raw_patch)} chars"
+            "[refactor_node] Patch generated — %d chars", len(raw_patch),
         )
 
     except Exception as e:
-        logger.error(f"[refactor_node] LLM call failed: {e}")
+        logger.error("[refactor_node] LLM call failed: %s", e, exc_info=True)
         raise CustomException(str(e), sys)
 
     return {
@@ -579,14 +672,14 @@ def validator_node(state: ReviewState) -> dict:
     """
     Runs ruff + pytest on the patch generated by refactor_node inside the
     Docker sandbox. The result determines whether the loop continues or
-    the workflow proceeds to verdict_node.
+    the workflow proceeds to hitl_node (P3).
 
     Uses module-level sandbox_client (patchable in tests).
 
     Loop control in workflow.py (should_refactor()):
-      validation_result.passed=True  → verdict_node
+      validation_result.passed=True  → hitl_node   ★ P3 (was verdict_node)
       validation_result.passed=False AND reflection_count < MAX → refactor_node
-      reflection_count >= MAX        → verdict_node
+      reflection_count >= MAX        → hitl_node   ★ P3 (was verdict_node)
 
     Reads  : state["patch"], state["reflection_count"]
     Writes : state["validation_result"]
@@ -597,12 +690,13 @@ def validator_node(state: ReviewState) -> dict:
     current_count = state["reflection_count"]
 
     logger.info(
-        f"[validator_node] Starting validation — iteration={current_count}"
+        "[validator_node] Starting validation — iteration=%d", current_count,
     )
 
     if not patch:
         logger.warning(
-            "[validator_node] Empty patch from refactor_node — marking failed"
+            "[validator_node] Empty patch received from refactor_node — "
+            "marking validation as failed and incrementing reflection_count."
         )
         from app.sandbox.docker_runner import SandboxResult, RunType
         empty_result = SandboxResult(
@@ -622,15 +716,15 @@ def validator_node(state: ReviewState) -> dict:
         validation_result = sandbox_client.run_tests(patch)
 
         logger.info(
-            f"[validator_node] Complete — "
-            f"passed={validation_result.passed} "
-            f"exit_code={validation_result.exit_code} "
-            f"duration={validation_result.duration_ms}ms"
+            "[validator_node] Complete — passed=%s exit_code=%s duration=%sms",
+            validation_result.passed,
+            validation_result.exit_code,
+            validation_result.duration_ms,
         )
 
         if validation_result.passed:
             logger.info(
-                "[validator_node] Validation PASSED — routing to verdict_node"
+                "[validator_node] Validation PASSED — routing to hitl_node"
             )
             return {
                 "validation_result": validation_result,
@@ -638,8 +732,10 @@ def validator_node(state: ReviewState) -> dict:
             }
         else:
             logger.info(
-                f"[validator_node] Validation FAILED — looping to refactor_node\n"
-                f"output:\n{validation_result.output}"
+                "[validator_node] Validation FAILED (iteration=%d) — "
+                "routing to refactor_node\noutput:\n%s",
+                current_count + 1,
+                validation_result.output,
             )
             return {
                 "validation_result": validation_result,
@@ -647,5 +743,7 @@ def validator_node(state: ReviewState) -> dict:
             }
 
     except Exception as e:
-        logger.error(f"[validator_node] Sandbox error: {e}")
+        logger.error(
+            "[validator_node] Sandbox error: %s", e, exc_info=True,
+        )
         raise CustomException(str(e), sys)

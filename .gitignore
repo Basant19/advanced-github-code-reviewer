@@ -47,3 +47,6 @@ chroma_store/
 # Coverage
 .coverage
 htmlcov/
+
+
+workflow_graph.png
