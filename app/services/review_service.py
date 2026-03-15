@@ -2,45 +2,49 @@
 app/services/review_service.py
 
 Review Orchestration Service
-------------------------------
-The single entry point for triggering, persisting, and retrieving PR reviews.
+----------------------------
 
-Responsibilities:
-    1. trigger_review()  — run the full LangGraph workflow, persist results,
-                           post the summary comment back to GitHub
-    2. get_review()      — fetch a single review with its steps from DB
-    3. list_reviews()    — list all reviews for a repository
+This module is responsible for orchestrating the full lifecycle of
+an AI-based Pull Request review.
 
-Flow inside trigger_review():
-    ┌─────────────────────────────────────────────────────────┐
-    │ 1. get_or_create Repository record                      │
-    │ 2. get_or_create PullRequest stub (before workflow)     │
-    │ 3. create Review record  (status="running")             │
-    │ 4. run_review()  →  LangGraph executes all 4 nodes      │
-    │ 5. update PullRequest with real metadata from GitHub    │
-    │ 6. persist ReviewStep for each stage                    │
-    │ 7. update Review  (status="completed", verdict, summary)│
-    │ 8. GitHubClient.post_review_comment()                   │
-    └─────────────────────────────────────────────────────────┘
-    On any failure → update Review status="failed", re-raise
+Responsibilities
+----------------
+1. Trigger LangGraph review workflow
+2. Persist review results in database
+3. Store workflow execution steps
+4. Handle HITL (Human-in-the-loop) interruptions
+5. Post results to GitHub
 
-Column names (aligned to actual DB schema):
-    Repository  : id, name, owner, url, default_branch, created_at, updated_at
-    PullRequest : id, repo_id, pr_number, title, author, branch,
-                  status, created_at, updated_at
-    Review      : id, pull_request_id, reviewer, status, verdict,
-                  summary, created_at, updated_at
-    ReviewStep  : id, review_id, step_name, status, input_data,
-                  output_data, logs, created_at
+Architecture
+------------
+FastAPI Route
+      │
+      ▼
+Review Service
+      │
+      ▼
+LangGraph Workflow
+      │
+      ▼
+Database + GitHub API
+
+Error Handling
+--------------
+All unexpected errors are wrapped inside CustomException so that the
+API layer can convert them into HTTP responses.
 """
 
 import sys
 import json
+import uuid
 from datetime import datetime, timezone
+from typing import List, Dict
 
-from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.graph.workflow import run_review
+from app.graph.workflow import review_graph
+from app.graph.state import build_initial_state
 from app.mcp.github_client import GitHubClient
 from app.db.models.repository import Repository
 from app.db.models.pull_request import PullRequest
@@ -52,334 +56,434 @@ from app.core.logger import get_logger
 logger = get_logger(__name__)
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# GraphInterrupt import (LangGraph compatibility)
+# ─────────────────────────────────────────────
+try:
+    from langgraph.errors import GraphInterrupt
+except ImportError:
+    try:
+        from langgraph.types import GraphInterrupt
+    except ImportError:
+        class GraphInterrupt(Exception):
+            pass
 
-def _get_or_create_repository(
-    db: Session, owner: str, repo: str
+
+# ─────────────────────────────────────────────
+# Helper Functions
+# ─────────────────────────────────────────────
+
+async def _get_or_create_repository(
+    db: AsyncSession,
+    owner: str,
+    repo: str
 ) -> Repository:
-    """
-    Fetches existing Repository or creates a new one.
+    """Fetch repository or create it if missing."""
 
-    Repository model columns:
-        id, name, owner, url, default_branch, created_at, updated_at
-    """
-    record = (
-        db.query(Repository)
-        .filter_by(owner=owner, name=repo)
-        .first()
-    )
-    if record:
-        return record
+    try:
+        result = await db.execute(
+            select(Repository).where(
+                Repository.owner == owner,
+                Repository.name == repo,
+            )
+        )
 
-    record = Repository(
-        owner=owner,
-        name=repo,
-        url=f"https://github.com/{owner}/{repo}",  # url is NOT NULL
-        default_branch="main",
-    )
-    db.add(record)
-    db.commit()
-    db.refresh(record)
-    logger.info(f"[review_service] Created Repository — {owner}/{repo}")
-    return record
+        repository = result.scalar_one_or_none()
+
+        if repository:
+            return repository
+
+        repository = Repository(
+            owner=owner,
+            name=repo,
+            url=f"https://github.com/{owner}/{repo}",
+            default_branch="main",
+        )
+
+        db.add(repository)
+        await db.commit()
+        await db.refresh(repository)
+
+        logger.info(
+            "[review_service] Repository created | %s/%s",
+            owner,
+            repo,
+        )
+
+        return repository
+
+    except Exception as e:
+        await db.rollback()
+        logger.error(
+            "[review_service] Repository creation failed",
+            exc_info=True
+        )
+        raise CustomException(str(e), sys)
 
 
-def _get_or_create_pull_request(
-    db:         Session,
+async def _get_or_create_pull_request(
+    db: AsyncSession,
     repository: Repository,
-    pr_number:  int,
-    metadata:   dict,
+    pr_number: int,
+    metadata: Dict,
 ) -> PullRequest:
-    """
-    Fetches existing PullRequest or creates a new one.
+    """Fetch PR record or create stub."""
 
-    PullRequest model columns:
-        id, repo_id, pr_number, title, author, branch,
-        status, created_at, updated_at
+    try:
+        result = await db.execute(
+            select(PullRequest).where(
+                PullRequest.repo_id == repository.id,
+                PullRequest.pr_number == pr_number,
+            )
+        )
 
-    Key corrections vs old code:
-        repo_id       not repository_id
-        pr_number     not number
-        branch        not head_branch (model has single branch column)
-        status        not state
-    """
-    record = (
-        db.query(PullRequest)
-        .filter_by(repo_id=repository.id, pr_number=pr_number)
-        .first()
-    )
-    if record:
-        # Update mutable fields on re-review
-        new_title = metadata.get("title")
-        new_state = metadata.get("state")
-        if new_title:
-            record.title = new_title
-        if new_state:
-            record.status = new_state
-        db.commit()
-        return record
+        pr = result.scalar_one_or_none()
 
-    record = PullRequest(
-        repo_id=repository.id,
-        pr_number=pr_number,
-        title=metadata.get("title",        "Untitled PR"),
-        author=metadata.get("author",      "unknown"),
-        branch=metadata.get("head_branch", "unknown"),
-        status=metadata.get("state",       "open"),
-    )
-    db.add(record)
-    db.commit()
-    db.refresh(record)
-    logger.info(
-        f"[review_service] Created PullRequest — "
-        f"#{pr_number} '{record.title}'"
-    )
-    return record
+        if pr:
+            if metadata.get("title"):
+                pr.title = metadata["title"]
+
+            if metadata.get("state"):
+                pr.status = metadata["state"]
+
+            await db.commit()
+            return pr
+
+        pr = PullRequest(
+            repo_id=repository.id,
+            pr_number=pr_number,
+            title=metadata.get("title", "Untitled PR"),
+            author=metadata.get("author", "unknown"),
+            branch=metadata.get("head_branch", "unknown"),
+            status=metadata.get("state", "open"),
+        )
+
+        db.add(pr)
+        await db.commit()
+        await db.refresh(pr)
+
+        logger.info(
+            "[review_service] PullRequest created | #%s %s",
+            pr_number,
+            pr.title,
+        )
+
+        return pr
+
+    except Exception as e:
+        await db.rollback()
+        logger.error(
+            "[review_service] PullRequest operation failed",
+            exc_info=True
+        )
+        raise CustomException(str(e), sys)
 
 
-def _persist_review_steps(
-    db:          Session,
-    review:      Review,
-    final_state: dict,
+async def _persist_review_steps(
+    db: AsyncSession,
+    review: Review,
+    final_state: Dict,
 ) -> None:
-    """
-    Bulk-inserts 4 ReviewStep records — one per LangGraph node.
+    """Persist workflow steps."""
 
-    ReviewStep model columns:
-        id, review_id, step_name, status, input_data,
-        output_data, logs, created_at
-
-    Note: input_data and output_data are TEXT columns — must be JSON strings.
-    """
     now = datetime.now(timezone.utc)
 
-    steps = [
-        ReviewStep(
-            review_id=review.id,
-            step_name="fetch_diff",
-            status="completed",
-            input_data=json.dumps({
-                "pr_number": final_state.get("pr_number"),
-            }),
-            output_data=json.dumps({
-                "files_changed": len(final_state.get("files", [])),
-                "diff_length":   len(final_state.get("diff",  "")),
-            }),
-            created_at=now,
-        ),
-        ReviewStep(
-            review_id=review.id,
-            step_name="analyze_code",
-            status="completed",
-            input_data=json.dumps({
-                "diff_length": len(final_state.get("diff", "")),
-            }),
-            output_data=json.dumps({
-                "issues":            final_state.get("issues",      []),
-                "suggestions":       final_state.get("suggestions", []),
-                "repo_context_used": bool(final_state.get("repo_context")),
-            }),
-            created_at=now,
-        ),
-        ReviewStep(
-            review_id=review.id,
-            step_name="reflect",
-            status="completed",
-            input_data=json.dumps({}),
-            output_data=json.dumps({
-                "reflection_count":  final_state.get("reflection_count", 0),
-                "final_issues":      final_state.get("issues",      []),
-                "final_suggestions": final_state.get("suggestions", []),
-            }),
-            created_at=now,
-        ),
-        ReviewStep(
-            review_id=review.id,
-            step_name="verdict",
-            status="completed",
-            input_data=json.dumps({
-                "issues_count":      len(final_state.get("issues",      [])),
-                "suggestions_count": len(final_state.get("suggestions", [])),
-            }),
-            output_data=json.dumps({
-                "verdict": final_state.get("verdict", ""),
-            }),
-            created_at=now,
-        ),
-    ]
+    try:
+        steps = [
+            ReviewStep(
+                review_id=review.id,
+                step_name="fetch_diff",
+                status="completed",
+                input_data=json.dumps({"pr_number": final_state.get("pr_number")}),
+                output_data=json.dumps({
+                    "files_changed": len(final_state.get("files", [])),
+                    "diff_length": len(final_state.get("diff", "")),
+                }),
+                created_at=now,
+            ),
+            ReviewStep(
+                review_id=review.id,
+                step_name="analyze_code",
+                status="completed",
+                input_data=json.dumps({"diff_length": len(final_state.get("diff", ""))}),
+                output_data=json.dumps({
+                    "issues": final_state.get("issues", []),
+                    "suggestions": final_state.get("suggestions", []),
+                }),
+                created_at=now,
+            ),
+            ReviewStep(
+                review_id=review.id,
+                step_name="verdict",
+                status="completed",
+                input_data=json.dumps({}),
+                output_data=json.dumps({
+                    "verdict": final_state.get("verdict")
+                }),
+                created_at=now,
+            ),
+        ]
 
-    db.bulk_save_objects(steps)
-    db.commit()
-    logger.info(
-        f"[review_service] Persisted {len(steps)} ReviewStep records "
-        f"for review_id={review.id}"
-    )
+        db.add_all(steps)
+        await db.commit()
+
+        logger.info(
+            "[review_service] %d workflow steps stored | review_id=%s",
+            len(steps),
+            review.id,
+        )
+
+    except Exception as e:
+        await db.rollback()
+        logger.error(
+            "[review_service] Step persistence failed",
+            exc_info=True
+        )
+        raise CustomException(str(e), sys)
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# Core Service Functions
+# ─────────────────────────────────────────────
 
-def trigger_review(
-    owner:     str,
-    repo:      str,
+async def trigger_review(
+    owner: str,
+    repo: str,
     pr_number: int,
-    db:        Session,
+    db: AsyncSession,
 ) -> Review:
     """
-    Runs the complete PR review pipeline and returns the completed Review record.
+    Trigger a full PR review workflow.
 
-    Review model columns:
-        pull_request_id, reviewer, status, verdict, summary,
-        created_at, updated_at
-
-    No repository_id on Review — Review links to PullRequest, not Repository.
-    No pr_number on Review — that lives on PullRequest.
-    No completed_at on Review — updated_at tracks last modification.
-
-    Raises:
-        CustomException on any unrecoverable error.
+    Returns
+    -------
+    Review
+        Persisted review object.
     """
-    logger.info(f"[trigger_review] Starting — {owner}/{repo}#{pr_number}")
-
-    # Step 1 — ensure repository record exists
-    repository = _get_or_create_repository(db, owner, repo)
-
-    # Step 2 — create a PullRequest stub so Review FK is satisfied
-    # Metadata is empty here — real metadata comes from GitHub after workflow
-    stub_pr = _get_or_create_pull_request(db, repository, pr_number, {})
-
-    # Step 3 — create Review in "running" state
-    review = Review(
-        pull_request_id=stub_pr.id,  # pull_request_id not repository_id
-        reviewer="ai",
-        status="running",
-    )
-    db.add(review)
-    db.commit()
-    db.refresh(review)
 
     logger.info(
-        f"[trigger_review] Review record created — "
-        f"id={review.id}, status=running"
+        "[review_service] Trigger review | %s/%s#%s",
+        owner,
+        repo,
+        pr_number,
     )
 
     try:
-        # Step 4 — run LangGraph workflow (20-60s)
-        final_state = run_review(owner, repo, pr_number)
 
-        # Step 5 — update PullRequest with real metadata fetched by workflow
-        pull_request = _get_or_create_pull_request(
-            db, repository, pr_number,
-            final_state.get("metadata", {}),
+        initial_state = build_initial_state(owner, repo, pr_number)
+
+        repository = await _get_or_create_repository(db, owner, repo)
+
+        stub_pr = await _get_or_create_pull_request(
+            db,
+            repository,
+            pr_number,
+            {}
         )
-        review.pull_request_id = pull_request.id
 
-        # Step 6 — persist 4 step records
-        _persist_review_steps(db, review, final_state)
+        thread_id = str(uuid.uuid4())
 
-        # Step 7 — mark review completed
-        review.verdict = final_state.get("verdict", "")
-        review.summary = final_state.get("summary", "")
-        review.status  = "completed"
-        # updated_at auto-set by onupdate=func.now()
-        db.commit()
-        db.refresh(review)
+        review = Review(
+            pull_request_id=stub_pr.id,
+            reviewer="ai",
+            status="running",
+            thread_id=thread_id,
+        )
+
+        db.add(review)
+        await db.commit()
+        await db.refresh(review)
 
         logger.info(
-            f"[trigger_review] Completed — "
-            f"id={review.id}, verdict={review.verdict}"
+            "[review_service] Review started | id=%s thread=%s",
+            review.id,
+            thread_id,
         )
 
-        # Step 8 — post GitHub comment (non-fatal)
-        try:
-            github_client = GitHubClient()
-            github_client.post_review_comment(
-                owner, repo, pr_number,
-                final_state.get("summary", ""),
-            )
-            logger.info(
-                f"[trigger_review] GitHub comment posted — "
-                f"{owner}/{repo}#{pr_number}"
-            )
-        except Exception as gh_err:
-            logger.warning(
-                f"[trigger_review] GitHub comment failed "
-                f"(review still saved): {gh_err}"
-            )
+        config = {"configurable": {"thread_id": thread_id}}
+
+        final_state = await review_graph.ainvoke(
+            initial_state,
+            config=config
+        )
+
+        pull_request = await _get_or_create_pull_request(
+            db,
+            repository,
+            pr_number,
+            final_state.get("metadata", {}),
+        )
+
+        review.pull_request_id = pull_request.id
+
+        await _persist_review_steps(db, review, final_state)
+
+        review.verdict = final_state.get("verdict")
+        review.summary = final_state.get("summary")
+        review.status = "completed"
+
+        await db.commit()
+        await db.refresh(review)
+
+        logger.info(
+            "[review_service] Review completed | id=%s verdict=%s",
+            review.id,
+            review.verdict,
+        )
+
+        if review.verdict != "HUMAN_REJECTED":
+
+            try:
+                github_client = GitHubClient()
+
+                github_client.post_review_comment(
+                    owner,
+                    repo,
+                    pr_number,
+                    final_state.get("summary", ""),
+                )
+
+                logger.info(
+                    "[review_service] GitHub comment posted"
+                )
+
+            except Exception:
+                logger.warning(
+                    "[review_service] GitHub comment failed",
+                    exc_info=True,
+                )
+
+        return review
+
+    except GraphInterrupt:
+
+        logger.info(
+            "[review_service] HITL interrupt | review_id=%s",
+            review.id,
+        )
+
+        review.status = "pending_hitl"
+        await db.commit()
+        await db.refresh(review)
 
         return review
 
     except Exception as e:
-        # Best-effort status update — don't let this mask the real error
+
+        await db.rollback()
+
         try:
             review.status = "failed"
-            db.commit()
+            await db.commit()
         except Exception:
             pass
 
-        logger.error(f"[trigger_review] Failed — id={review.id}: {e}")
+        logger.error(
+            "[review_service] Review execution failed",
+            exc_info=True,
+        )
 
-        if isinstance(e, CustomException):
-            raise
         raise CustomException(str(e), sys)
 
 
-def get_review(review_id: int, db: Session) -> Review:
-    """
-    Fetches a single Review by ID, steps accessible via review.steps.
+# ─────────────────────────────────────────────
+# Query Services
+# ─────────────────────────────────────────────
 
-    Raises:
-        CustomException if not found or DB error.
-    """
-    logger.info(f"[get_review] Fetching review_id={review_id}")
+async def get_review(
+    review_id: int,
+    db: AsyncSession,
+) -> Review:
+    """Retrieve a single review."""
 
     try:
-        review = db.query(Review).filter_by(id=review_id).first()
+        result = await db.execute(
+            select(Review).where(Review.id == review_id)
+        )
+
+        review = result.scalar_one_or_none()
+
         if not review:
-            raise ValueError(f"Review id={review_id} not found")
+            raise CustomException(
+                f"Review {review_id} not found",
+                sys
+            )
+
         return review
 
-    except ValueError as e:
-        logger.warning(f"[get_review] {e}")
-        raise CustomException(str(e), sys)
     except Exception as e:
-        logger.error(f"[get_review] DB error: {e}")
+        logger.error("[review_service] get_review failed", exc_info=True)
         raise CustomException(str(e), sys)
 
 
-def list_reviews(owner: str, repo: str, db: Session) -> list[Review]:
-    """
-    Lists all reviews for a repo ordered by most recent first.
-
-    Review has no direct repo FK — must join through PullRequest.
-    Returns empty list if repo has no record, never raises for missing repo.
-    """
-    logger.info(f"[list_reviews] {owner}/{repo}")
+async def list_reviews(
+    owner: str,
+    repo: str,
+    db: AsyncSession,
+) -> List[Review]:
+    """List all reviews for a repository."""
 
     try:
-        repository = (
-            db.query(Repository)
-            .filter_by(owner=owner, name=repo)
-            .first()
+        result = await db.execute(
+            select(Repository).where(
+                Repository.owner == owner,
+                Repository.name == repo,
+            )
         )
+
+        repository = result.scalar_one_or_none()
 
         if not repository:
-            logger.info(f"[list_reviews] No repository found for {owner}/{repo}")
             return []
 
-        # Review → PullRequest → Repository (two hops, no direct FK)
-        reviews = (
-            db.query(Review)
+        result = await db.execute(
+            select(Review)
             .join(PullRequest, Review.pull_request_id == PullRequest.id)
-            .filter(PullRequest.repo_id == repository.id)
+            .where(PullRequest.repo_id == repository.id)
             .order_by(Review.created_at.desc())
-            .all()
         )
 
-        logger.info(
-            f"[list_reviews] Found {len(reviews)} review(s) for {owner}/{repo}"
+        return result.scalars().all()
+
+    except Exception as e:
+        logger.error("[review_service] list_reviews failed", exc_info=True)
+        raise CustomException(str(e), sys)
+
+
+async def list_all_reviews(db: AsyncSession) -> List[Dict]:
+    """Return all reviews across repositories."""
+
+    try:
+
+        result = await db.execute(
+            select(Review, PullRequest, Repository)
+            .join(PullRequest, Review.pull_request_id == PullRequest.id)
+            .join(Repository, PullRequest.repo_id == Repository.id)
+            .order_by(Review.created_at.desc())
         )
+
+        rows = result.all()
+
+        reviews = []
+
+        for review, pr, repo in rows:
+
+            reviews.append({
+                "id": review.id,
+                "status": review.status,
+                "verdict": review.verdict,
+                "summary": review.summary,
+                "thread_id": review.thread_id,
+                "created_at": review.created_at.isoformat() if review.created_at else None,
+                "repo": f"{repo.owner}/{repo.name}",
+                "pr_number": pr.pr_number,
+                "title": pr.title,
+                "author": pr.author,
+                "branch": pr.branch,
+            })
+
         return reviews
 
     except Exception as e:
-        logger.error(f"[list_reviews] DB error: {e}")
+        logger.error("[review_service] list_all_reviews failed", exc_info=True)
         raise CustomException(str(e), sys)

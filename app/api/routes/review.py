@@ -2,33 +2,45 @@
 app/api/routes/review.py
 
 Review API Routes
+-----------------
+REST endpoints responsible for triggering and retrieving
+Pull Request reviews processed by the AI review pipeline.
+
+These routes act as the HTTP interface between the client
+(UI / GitHub webhook / CLI) and the review_service layer.
+
+Architecture Layer
 ------------------
-REST endpoints for triggering and retrieving PR reviews.
+Client → FastAPI Routes → Service Layer → Database + LangGraph
 
-Endpoints:
-    POST /reviews/trigger              — manually trigger a review (no webhook needed)
-    GET  /reviews/{owner}/{repo}       — list all reviews for a repository
-    GET  /reviews/{review_id}          — get a single review with its steps
+Routes
+------
+POST   /reviews/trigger
+    Manually trigger a review for a GitHub Pull Request.
 
-All routes delegate to review_service.py — no business logic lives here.
+GET    /reviews/{owner}/{repo}
+    Retrieve all reviews belonging to a repository.
 
-Error handling:
-    CustomException from the service layer is caught and converted to
-    appropriate HTTP responses (404 for not found, 500 for unexpected errors).
+GET    /reviews/{review_id}
+    Retrieve a specific review with step-by-step execution details.
 
-Import chain (no circular imports):
-    review.py  →  review_service.py  →  graph/workflow.py
-                                     →  db/models/*
-                                     →  mcp/github_client.py
+Error Handling
+--------------
+Service layer raises CustomException which is converted into
+appropriate HTTP responses here.
+
+Async Notes
+-----------
+All endpoints use AsyncSession because the application runs on
+async SQLAlchemy with asyncpg.
 """
 
-import sys
-from typing import Optional
+from typing import Optional, List
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi import status as http_status
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db
 from app.core.exceptions import CustomException
@@ -44,172 +56,226 @@ logger = get_logger(__name__)
 router = APIRouter(prefix="/reviews", tags=["reviews"])
 
 
-# ── Request / Response schemas ────────────────────────────────────────────────
-# Defined inline to avoid circular imports with schemas/ package.
+# ─────────────────────────────────────────────
+# Request / Response Schemas
+# ─────────────────────────────────────────────
 
 class TriggerReviewRequest(BaseModel):
-    owner:     str
-    repo:      str
+    """Request body for manually triggering a review."""
+    owner: str
+    repo: str
     pr_number: int
 
 
 class ReviewStepResponse(BaseModel):
+    """Represents a single step executed during the review workflow."""
+
     model_config = ConfigDict(from_attributes=True)
 
-    id:          int
-    step_name:   str
-    input_data:  Optional[dict] = None
+    id: int
+    step_name: str
+    input_data: Optional[dict] = None
     output_data: Optional[dict] = None
 
 
 class ReviewResponse(BaseModel):
+    """Minimal review response used in list endpoints."""
+
     model_config = ConfigDict(from_attributes=True)
 
-    id:           int
-    pr_number:    int
-    status:       str
-    verdict:      Optional[str] = None
-    summary:      Optional[str] = None
-    created_at:   Optional[str] = None
-    completed_at: Optional[str] = None
+    id: int
+    status: str
+    verdict: Optional[str] = None
+    summary: Optional[str] = None
+    created_at: Optional[str] = None
 
 
 class ReviewDetailResponse(ReviewResponse):
-    model_config = ConfigDict(from_attributes=True)
+    """Full review response including step execution history."""
 
-    steps: list[ReviewStepResponse] = []
+    steps: List[ReviewStepResponse] = []
 
 
 class TriggerReviewResponse(BaseModel):
+    """Response returned immediately after triggering a review."""
+
     review_id: int
-    status:    str
-    verdict:   Optional[str] = None
-    message:   str
+    status: str
+    verdict: Optional[str] = None
+    message: str
 
 
-# ── Helper ────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# Helper
+# ─────────────────────────────────────────────
 
 def _handle_service_error(e: Exception, context: str) -> None:
     """
-    Converts CustomException to HTTP responses.
-    "not found" in message → 404, anything else → 500.
+    Converts service layer exceptions into HTTP responses.
+
+    Parameters
+    ----------
+    e : Exception
+        Exception raised by service layer.
+    context : str
+        Context describing where the error occurred.
     """
-    message = str(e).lower()
-    if "not found" in message:
-        raise HTTPException(
-            status_code=http_status.HTTP_404_NOT_FOUND,
-            detail=str(e),
+
+    if isinstance(e, CustomException):
+        logger.error(
+            "[review_route] %s | service_error=%s",
+            context,
+            str(e),
+            exc_info=True
         )
-    logger.error(f"[review_route] {context}: {e}")
+
+        if "not found" in str(e).lower():
+            raise HTTPException(
+                status_code=http_status.HTTP_404_NOT_FOUND,
+                detail=str(e)
+            )
+
+        raise HTTPException(
+            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+    logger.error(
+        "[review_route] %s | unexpected_error=%s",
+        context,
+        str(e),
+        exc_info=True
+    )
+
     raise HTTPException(
         status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
-        detail=f"Internal error during {context}",
+        detail="Internal server error"
     )
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
-# Order matters: /trigger must come before /{owner}/{repo} so FastAPI
-# does not try to match "trigger" as an owner path parameter.
+# ─────────────────────────────────────────────
+# Routes
+# ─────────────────────────────────────────────
 
 @router.post(
     "/trigger",
-    status_code=http_status.HTTP_202_ACCEPTED,
     response_model=TriggerReviewResponse,
-    summary="Manually trigger a PR review",
+    status_code=http_status.HTTP_202_ACCEPTED,
+    summary="Manually trigger a PR review"
 )
-def trigger_review_route(
+async def trigger_review_route(
     request: TriggerReviewRequest,
-    db:      Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
 ) -> TriggerReviewResponse:
     """
-    Manually triggers a PR review without needing a GitHub webhook.
-    Useful for testing and re-reviewing existing PRs.
+    Triggers the AI review workflow for a GitHub Pull Request.
 
-    Runs synchronously — blocks until review completes.
-    Use the webhook endpoint for async background execution.
+    The workflow is executed asynchronously via LangGraph.
+
+    Possible states returned immediately:
+        running
+        pending_hitl
+        completed
+
+    HITL (Human-in-the-Loop):
+    If the workflow reaches the HITL node, execution pauses and
+    the review status becomes `pending_hitl`.
     """
+
     logger.info(
-        f"[review_route] Manual trigger — "
-        f"{request.owner}/{request.repo}#{request.pr_number}"
+        "[review_route] Trigger review request received | repo=%s/%s pr=%s",
+        request.owner,
+        request.repo,
+        request.pr_number,
     )
 
     try:
-        review = trigger_review(
+        review = await trigger_review(
             owner=request.owner,
             repo=request.repo,
             pr_number=request.pr_number,
             db=db,
         )
 
+        message = (
+            "Review suspended at HITL gate"
+            if review.status == "pending_hitl"
+            else "Review completed"
+        )
+
         return TriggerReviewResponse(
             review_id=review.id,
             status=review.status,
             verdict=review.verdict,
-            message=(
-                f"Review completed for "
-                f"{request.owner}/{request.repo}#{request.pr_number}"
-            ),
+            message=message,
         )
 
-    except CustomException as e:
-        _handle_service_error(e, "trigger_review")
+    except Exception as e:
+        _handle_service_error(e, "trigger_review_route")
 
 
 @router.get(
     "/{owner}/{repo}",
-    status_code=http_status.HTTP_200_OK,
-    response_model=list[ReviewResponse],
+    response_model=List[ReviewResponse],
     summary="List all reviews for a repository",
 )
-def list_reviews_route(
+async def list_reviews_route(
     owner: str,
-    repo:  str,
-    db:    Session = Depends(get_db),
-) -> list[ReviewResponse]:
+    repo: str,
+    db: AsyncSession = Depends(get_db),
+) -> List[ReviewResponse]:
     """
-    Returns all reviews for a given repository, ordered most recent first.
-    Returns an empty list if the repository has no reviews yet.
+    Returns all reviews associated with a repository.
+    Results are ordered by most recent first.
     """
-    logger.info(f"[review_route] List reviews — {owner}/{repo}")
+
+    logger.info(
+        "[review_route] Fetch reviews | repo=%s/%s",
+        owner,
+        repo,
+    )
 
     try:
-        reviews = list_reviews(owner=owner, repo=repo, db=db)
+        reviews = await list_reviews(owner=owner, repo=repo, db=db)
 
         return [
             ReviewResponse(
                 id=r.id,
-                pr_number=r.pr_number,
                 status=r.status,
                 verdict=r.verdict,
                 summary=r.summary,
-                created_at=str(r.created_at)     if r.created_at   else None,
-                completed_at=str(r.completed_at) if r.completed_at else None,
+                created_at=str(r.created_at) if r.created_at else None,
             )
             for r in reviews
         ]
 
-    except CustomException as e:
-        _handle_service_error(e, "list_reviews")
+    except Exception as e:
+        _handle_service_error(e, "list_reviews_route")
 
 
 @router.get(
     "/{review_id}",
-    status_code=http_status.HTTP_200_OK,
     response_model=ReviewDetailResponse,
-    summary="Get a single review with its steps",
+    summary="Get a single review",
 )
-def get_review_route(
+async def get_review_route(
     review_id: int,
-    db:        Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
 ) -> ReviewDetailResponse:
     """
-    Returns a single review by ID, including all ReviewStep records
-    showing what each LangGraph node produced.
+    Returns detailed information for a specific review.
+
+    Includes the execution steps generated by the
+    LangGraph workflow nodes.
     """
-    logger.info(f"[review_route] Get review — id={review_id}")
+
+    logger.info(
+        "[review_route] Fetch review details | review_id=%s",
+        review_id,
+    )
 
     try:
-        review = get_review(review_id=review_id, db=db)
+        review = await get_review(review_id=review_id, db=db)
 
         steps = [
             ReviewStepResponse(
@@ -223,14 +289,12 @@ def get_review_route(
 
         return ReviewDetailResponse(
             id=review.id,
-            pr_number=review.pr_number,
             status=review.status,
             verdict=review.verdict,
             summary=review.summary,
-            created_at=str(review.created_at)     if review.created_at   else None,
-            completed_at=str(review.completed_at) if review.completed_at else None,
+            created_at=str(review.created_at) if review.created_at else None,
             steps=steps,
         )
 
-    except CustomException as e:
-        _handle_service_error(e, "get_review")
+    except Exception as e:
+        _handle_service_error(e, "get_review_route")

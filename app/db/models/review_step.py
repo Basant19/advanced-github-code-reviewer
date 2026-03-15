@@ -57,8 +57,8 @@ Usage
 """
 
 import sys
-from datetime import datetime
 
+from datetime import datetime, timezone
 from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey
 from sqlalchemy.orm import relationship
 
@@ -155,9 +155,9 @@ class ReviewStep(Base):
         )
 
         created_at = Column(
-            DateTime,
-            default=datetime.utcnow,
-            nullable=False
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False
         )
 
         # Relationship to Review

@@ -1,75 +1,81 @@
 """
-Database Session Configuration
+app/db/session.py
 
-This module initializes the SQLAlchemy engine and session factory
-used throughout the application.
+SQLAlchemy Database Session Configuration
+------------------------------------------
+Creates the async engine and session factory for all FastAPI routes.
 
-Responsibilities
----------------
-1. Establish connection to PostgreSQL database.
-2. Manage database connection pool.
-3. Provide session factory for database operations.
-4. Integrate logging and structured exception handling.
+Driver: asyncpg
+    asyncpg is the native async PostgreSQL driver. It works correctly
+    with FastAPI, SQLAlchemy async, uvicorn, and Windows without any
+    event loop policy hacks.
 
-Architecture
-------------
-FastAPI
-   │
-SQLAlchemy Engine
-   │
-PostgreSQL
+    DATABASE_URL in .env must use the asyncpg scheme:
+        postgresql+asyncpg://user:password@host:port/dbname
 
-Usage
------
-    from app.db.session import SessionLocal
+Exports:
+    async_engine       — AsyncEngine instance (asyncpg driver)
+    engine             — alias for async_engine (used by main.py startup)
+    AsyncSessionLocal  — async session factory (used by get_db() in deps.py)
 
-    db = SessionLocal()
+Usage (in deps.py):
+    async def get_db():
+        async with AsyncSessionLocal() as session:
+            yield session
 
-    try:
-        # perform database operations
-        ...
-    finally:
-        db.close()
+P3 update:
+    - Removed sync engine and SessionLocal (no sync code paths remain)
+    - Removed _make_async_url() helper (DATABASE_URL is now asyncpg directly)
+    - Removed Windows ProactorEventLoop workaround (not needed with asyncpg)
 """
 
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-import sys
+import logging
+
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from app.core.config import settings
-from app.core.logger import get_logger
-from app.core.exceptions import CustomException
 
+logger = logging.getLogger(__name__)
 
-logger = get_logger(__name__)
+# ── Async engine ──────────────────────────────────────────────────────────────
+# asyncpg connects natively via asyncio — no event loop compatibility issues.
+# pool_pre_ping=True sends a lightweight SELECT 1 before each connection is
+# handed out, ensuring stale connections are discarded automatically.
 
+logger.info("Initializing async database engine (asyncpg)")
 
-try:
-    logger.info("Initializing database engine")
+async_engine = create_async_engine(
+    settings.DATABASE_URL,  # must be postgresql+asyncpg://...
+    pool_pre_ping=True,
+    echo=False,
+)
 
-    engine = create_engine(
-        settings.DATABASE_URL,
-        echo=True  # prints SQL queries during development
-    )
+logger.info("Async database engine initialized successfully")
 
-    logger.info("Database engine initialized successfully")
+# ── Engine alias ──────────────────────────────────────────────────────────────
+# main.py imports `engine` and calls `async with engine.begin()` on startup.
+# Exposing async_engine under the name `engine` keeps main.py unchanged.
 
-except Exception as e:
-    logger.error("Database engine initialization failed")
-    raise CustomException(e, sys)
+engine = async_engine
 
+# ── Async session factory ─────────────────────────────────────────────────────
+# async_sessionmaker is the async equivalent of sessionmaker.
+# expire_on_commit=False — prevents SQLAlchemy from expiring ORM objects after
+# commit, which would trigger lazy loads on already-closed sessions.
 
-try:
-    logger.info("Creating database session factory")
+logger.info("Creating async session factory")
 
-    SessionLocal = sessionmaker(
-        autocommit=False,
-        autoflush=False,
-        bind=engine,
-    )
+AsyncSessionLocal = async_sessionmaker(
+    bind=async_engine,
+    class_=AsyncSession,
+    autocommit=False,
+    autoflush=False,
+    expire_on_commit=False,
+)
 
-    logger.info("Session factory created successfully")
-
-except Exception as e:
-    logger.error("Session factory creation failed")
-    raise CustomException(e, sys)
+logger.info("Async session factory created successfully")
+logger.info("Database session configuration complete — driver: asyncpg")

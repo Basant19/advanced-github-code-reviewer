@@ -69,6 +69,12 @@ class Review(Base):
             Text,
             nullable=True
         )
+        
+        thread_id = Column(
+            String(100),
+            nullable=True,
+            index=True
+        )
 
         created_at = Column(
             DateTime(timezone=True),

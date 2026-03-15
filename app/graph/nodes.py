@@ -88,7 +88,7 @@ logger.info(
 llm = init_chat_model(
     model="gemini-2.5-flash",
     model_provider="google_genai",
-    configurable_fields="any",
+
 )
 
 logger.info("LLM initialised — gemini-2.5-flash via init_chat_model")
@@ -544,17 +544,6 @@ def verdict_node(state: ReviewState) -> dict:
 
 @traceable(name="lint_node", tags=["sandbox", "lint"])
 def lint_node(state: ReviewState) -> dict:
-    """
-    Runs ruff on the post-patch version of changed files inside the Docker
-    sandbox. Executes BEFORE the Gemini reviewer — fail-fast design:
-    if ruff fails, route directly to refactor_node, skip the Gemini API call.
-
-    Uses module-level sandbox_client (patchable in tests).
-
-    Reads  : state["diff"]
-    Writes : state["lint_result"], state["lint_passed"]
-    Raises : CustomException on any sandbox or parse failure
-    """
     diff = state["diff"]
     logger.info("[lint_node] Starting lint run via Docker sandbox")
 
@@ -565,21 +554,35 @@ def lint_node(state: ReviewState) -> dict:
             "[lint_node] Complete — passed=%s exit_code=%s duration=%sms",
             lint_result.passed, lint_result.exit_code, lint_result.duration_ms,
         )
-
-        if lint_result.passed:
-            logger.info("[lint_node] Lint PASSED")
-        else:
-            logger.info(
-                "[lint_node] Lint FAILED\nruff output:\n%s",
-                lint_result.output,
-            )
-
         return {
             "lint_result": lint_result,
             "lint_passed": lint_result.passed,
         }
 
     except Exception as e:
+        error_msg = str(e).lower()
+
+        # ── No Python files in diff — skip lint gracefully ────────────────
+        # PRs that only change .md, .yml, .json etc. have no .py files
+        # for ruff to lint. This is not an error — skip and continue.
+        if "no python files" in error_msg or "only .py files" in error_msg:
+            logger.info(
+                "[lint_node] No Python files in diff — skipping lint (non-fatal)"
+            )
+            from app.sandbox.docker_runner import SandboxResult, RunType
+            skipped_result = SandboxResult(
+                passed=True,
+                output="No Python files to lint — skipped.",
+                errors="",
+                exit_code=0,
+                duration_ms=0,
+                tool=RunType.LINT.value,
+            )
+            return {
+                "lint_result": skipped_result,
+                "lint_passed": True,
+            }
+
         logger.error("[lint_node] Sandbox error: %s", e, exc_info=True)
         raise CustomException(str(e), sys)
 
@@ -743,6 +746,30 @@ def validator_node(state: ReviewState) -> dict:
             }
 
     except Exception as e:
+        
+        error_msg = str(e).lower()
+
+        # ── No Python files in patch — skip validation gracefully ─────────
+        # If lint was skipped (non-Python PR), the patch from refactor_node
+        # also contains no .py files. Skip validation and mark as passed.
+        if "no python files" in error_msg or "only .py files" in error_msg:
+            logger.info(
+                "[validator_node] No Python files in patch — skipping validation (non-fatal)"
+            )
+            from app.sandbox.docker_runner import SandboxResult, RunType
+            skipped_result = SandboxResult(
+                passed=True,
+                output="No Python files to validate — skipped.",
+                errors="",
+                exit_code=0,
+                duration_ms=0,
+                tool=RunType.TEST.value,
+            )
+            return {
+                "validation_result": skipped_result,
+                "reflection_count":  current_count,
+            }
+
         logger.error(
             "[validator_node] Sandbox error: %s", e, exc_info=True,
         )

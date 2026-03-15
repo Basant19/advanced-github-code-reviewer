@@ -21,16 +21,29 @@ LangGraph resume pattern:
     To resume, we invoke the compiled graph again with the same thread_id
     (via config={"configurable": {"thread_id": ...}}) and pass the human
     decision via graph.update_state() then ainvoke(None).
+
+Note on imports
+---------------
+`select` and `Review` are imported at MODULE LEVEL (not inside functions).
+This is intentional: it allows tests to patch `app.api.routes.hitl.select`
+and `app.api.routes.hitl.Review` without the patch being ignored because
+the names were already resolved inside a local scope.
+
+    # In tests:
+    with patch("app.api.routes.hitl.select", mock_select):
+        ...
 """
 
 import logging
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 from pydantic import BaseModel
 from typing import Optional
 
 from app.api.deps import get_db
 from app.core.exceptions import CustomException
+from app.db.models import Review          # ← correct path: app/db/models.py
 from app.graph.workflow import review_graph
 
 logger = logging.getLogger(__name__)
@@ -60,11 +73,9 @@ async def _get_pending_review(review_id: int, db: AsyncSession):
     Load a Review record and verify it is awaiting HITL decision.
     Raises 404 if not found, 409 if not in correct state.
 
-    Model lives at app.db.models — imported here to avoid circular deps.
+    `select` and `Review` are module-level names — patchable in tests via:
+        patch("app.api.routes.hitl.select", mock_select)
     """
-    from sqlalchemy import select
-    from app.db.models import Review  # ← correct path: app/db/models.py
-
     result = await db.execute(select(Review).where(Review.id == review_id))
     review = result.scalar_one_or_none()
 
@@ -273,10 +284,10 @@ async def get_review_status(
     """
     Returns the current status of a review.
     Streamlit dashboard polls this to detect when a review enters pending_hitl.
-    """
-    from sqlalchemy import select
-    from app.db.models import Review  # ← correct path: app/db/models.py
 
+    `select` and `Review` are module-level — patchable in tests via:
+        patch("app.api.routes.hitl.select", mock_select)
+    """
     result = await db.execute(select(Review).where(Review.id == review_id))
     review = result.scalar_one_or_none()
 

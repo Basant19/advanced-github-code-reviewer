@@ -12,6 +12,19 @@ Covers:
     verdict_node P3            — human_decision routing via nodes.py directly
 
 All DB and graph interactions are mocked — no real DB or LangGraph required.
+
+Key patching strategy for TestGetPendingReview / TestGetReviewStatus
+---------------------------------------------------------------------
+hitl.py imports `select` and `Review` at MODULE LEVEL.  When the module is
+already loaded, patching sys.modules has no effect — Python already resolved
+the names.  Instead we patch the *module-level name* that hitl.py bound:
+
+    patch("app.api.routes.hitl.select", _make_mock_select())
+
+This replaces the `select` callable inside the hitl module with a chainable
+mock whose return value flows through .where() → db.execute() without ever
+touching SQLAlchemy's column coercion logic.  The real `select` is never
+called, so passing a MagicMock Review class never raises ArgumentError.
 """
 
 import pytest
@@ -85,6 +98,34 @@ def _make_scalar_result(obj):
     return result
 
 
+def _make_mock_select():
+    """
+    Return a chainable mock that replaces sqlalchemy.select inside hitl.py.
+
+    hitl.py calls:  select(Review).where(Review.id == review_id)
+    We need: mock_select(anything).where(anything) → a mock query object
+    that db.execute() can consume (db.execute is an AsyncMock whose
+    return_value is controlled separately via _make_db_with_result).
+    """
+    mock_query = MagicMock()
+    mock_query.where.return_value = mock_query   # select(...).where(...) → same mock
+    mock_select = MagicMock(return_value=mock_query)
+    return mock_select
+
+
+def _make_db_with_result(obj):
+    """
+    Build an AsyncSession mock whose execute() returns a scalar result
+    containing `obj`.  Works alongside _make_mock_select() to let
+    _get_pending_review / get_review_status run without a real DB.
+    """
+    db = AsyncMock()
+    db.commit  = AsyncMock()
+    db.refresh = AsyncMock()
+    db.execute = AsyncMock(return_value=_make_scalar_result(obj))
+    return db
+
+
 def _call_verdict_node(
     human_decision,
     issues,
@@ -99,8 +140,7 @@ def _call_verdict_node(
     Call verdict_node directly with a fully constructed state dict.
 
     verdict_node lives in app.graph.nodes — it reads human_decision from state.
-    We pass lint_result / validation_result as MagicMocks with a .passed attr
-    when needed, or as None (the node handles both with state.get()).
+    lint_result / validation_result passed as None; node uses safe defaults.
     """
     from app.graph.nodes import verdict_node
 
@@ -366,44 +406,43 @@ class TestRejectReview:
 # ── TestGetPendingReview ──────────────────────────────────────────────────────
 
 class TestGetPendingReview:
-    """_get_pending_review helper — 404 and 409 cases."""
+    """
+    _get_pending_review helper — 404 and 409 cases.
+
+    Patching strategy
+    -----------------
+    hitl.py binds `select` at module level (top-level import).
+    patch("app.api.routes.hitl.select", ...) replaces that binding so
+    SQLAlchemy's real select() — which rejects MagicMock as a column
+    expression — is never called.
+    db.execute() return value is controlled via _make_db_with_result().
+    """
 
     @pytest.mark.asyncio
-    async def test_not_found_raises_404(self, mock_db):
+    async def test_not_found_raises_404(self):
         """Returns 404 when review does not exist."""
         from fastapi import HTTPException
         from app.api.routes.hitl import _get_pending_review
 
-        mock_db.execute = AsyncMock(return_value=_make_scalar_result(None))
+        db = _make_db_with_result(None)
 
-        # Patch the model import inside _get_pending_review so the test
-        # does not need a real DB schema — only the route logic is tested.
-        with patch("app.api.routes.hitl._get_pending_review",
-                   wraps=_get_pending_review):
-            # Patch app.db.models.Review so select() resolves without a real DB
-            mock_review_cls = MagicMock()
-            mock_review_cls.id = MagicMock()
-            with patch.dict("sys.modules", {"app.db.models": MagicMock(Review=mock_review_cls)}):
-                with pytest.raises(HTTPException) as exc_info:
-                    await _get_pending_review(review_id=999, db=mock_db)
+        with patch("app.api.routes.hitl.select", _make_mock_select()):
+            with pytest.raises(HTTPException) as exc_info:
+                await _get_pending_review(review_id=999, db=db)
 
         assert exc_info.value.status_code == 404
 
     @pytest.mark.asyncio
-    async def test_wrong_status_raises_409(self, mock_review_completed, mock_db):
+    async def test_wrong_status_raises_409(self, mock_review_completed):
         """Returns 409 when review is already completed (not pending_hitl)."""
         from fastapi import HTTPException
         from app.api.routes.hitl import _get_pending_review
 
-        mock_db.execute = AsyncMock(
-            return_value=_make_scalar_result(mock_review_completed)
-        )
+        db = _make_db_with_result(mock_review_completed)
 
-        mock_review_cls = MagicMock()
-        mock_review_cls.id = MagicMock()
-        with patch.dict("sys.modules", {"app.db.models": MagicMock(Review=mock_review_cls)}):
+        with patch("app.api.routes.hitl.select", _make_mock_select()):
             with pytest.raises(HTTPException) as exc_info:
-                await _get_pending_review(review_id=99, db=mock_db)
+                await _get_pending_review(review_id=99, db=db)
 
         assert exc_info.value.status_code == 409
         assert "pending_hitl" in exc_info.value.detail
@@ -415,36 +454,30 @@ class TestGetReviewStatus:
     """GET /reviews/{id}/status"""
 
     @pytest.mark.asyncio
-    async def test_status_happy_path(self, mock_review_pending, mock_db):
+    async def test_status_happy_path(self, mock_review_pending):
         """Returns review status dict for a valid review."""
         from app.api.routes.hitl import get_review_status
 
-        mock_db.execute = AsyncMock(
-            return_value=_make_scalar_result(mock_review_pending)
-        )
+        db = _make_db_with_result(mock_review_pending)
 
-        mock_review_cls = MagicMock()
-        mock_review_cls.id = MagicMock()
-        with patch.dict("sys.modules", {"app.db.models": MagicMock(Review=mock_review_cls)}):
-            result = await get_review_status(review_id=42, db=mock_db)
+        with patch("app.api.routes.hitl.select", _make_mock_select()):
+            result = await get_review_status(review_id=42, db=db)
 
         assert result["review_id"] == 42
         assert result["status"]    == "pending_hitl"
         assert result["thread_id"] == "thread-abc-123"
 
     @pytest.mark.asyncio
-    async def test_status_not_found_raises_404(self, mock_db):
+    async def test_status_not_found_raises_404(self):
         """Returns 404 when review does not exist."""
         from fastapi import HTTPException
         from app.api.routes.hitl import get_review_status
 
-        mock_db.execute = AsyncMock(return_value=_make_scalar_result(None))
+        db = _make_db_with_result(None)
 
-        mock_review_cls = MagicMock()
-        mock_review_cls.id = MagicMock()
-        with patch.dict("sys.modules", {"app.db.models": MagicMock(Review=mock_review_cls)}):
+        with patch("app.api.routes.hitl.select", _make_mock_select()):
             with pytest.raises(HTTPException) as exc_info:
-                await get_review_status(review_id=0, db=mock_db)
+                await get_review_status(review_id=0, db=db)
 
         assert exc_info.value.status_code == 404
 
