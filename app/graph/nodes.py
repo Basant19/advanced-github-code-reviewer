@@ -55,7 +55,7 @@ import sys
 from langsmith import traceable
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import SystemMessage, HumanMessage
-
+from langgraph.types import interrupt
 from app.graph.state import ReviewState
 from app.mcp.github_client import GitHubClient
 from app.core.config import settings
@@ -608,7 +608,8 @@ def refactor_node(state: ReviewState) -> dict:
     lint_result       = state.get("lint_result")
     validation_result = state.get("validation_result")
     current_count     = state["reflection_count"]
-
+    attempts          =state.get("refactor_attempts", 0) + 1
+    logger.info(f"[refactor_node] Generating patch — attempt={attempts}")
     logger.info(
         "[refactor_node] Generating patch — iteration=%d issues=%d",
         current_count + 1, len(issues),
@@ -774,3 +775,24 @@ def validator_node(state: ReviewState) -> dict:
             "[validator_node] Sandbox error: %s", e, exc_info=True,
         )
         raise CustomException(str(e), sys)
+    
+@traceable(name="hitl_node", tags=["hitl"])
+def hitl_node(state: ReviewState) -> dict:
+    """
+    P3: Human-in-the-loop interruption point.
+    Pauses the graph and awaits a manual resume from the Review Service.
+    """
+    logger.info("[hitl_node] HITL checkpoint reached — interrupting graph...")
+    
+    # This is the magic line that raises the interrupt signal
+    # The value passed to resume() in the service will be returned here
+    decision = interrupt({
+        "question": "Review generated. Should it be published to GitHub?",
+        "issues_count": len(state.get("issues", [])),
+        "verdict_suggestion": "REQUEST_CHANGES" if state.get("issues") else "APPROVE"
+    })
+    
+    logger.info(f"[hitl_node] Resumed with decision: {decision}")
+    
+    # Update the state with the human decision so verdict_node can see it
+    return {"human_decision": decision}

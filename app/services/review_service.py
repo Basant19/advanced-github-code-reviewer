@@ -1,63 +1,33 @@
-"""
-app/services/review_service.py
+#E:\advanced-github-code-reviewer\app\services\review_service.py
 
-Review Orchestration Service
-----------------------------
-
-This module is responsible for orchestrating the full lifecycle of
-an AI-based Pull Request review.
-
-Responsibilities
-----------------
-1. Trigger LangGraph review workflow
-2. Persist review results in database
-3. Store workflow execution steps
-4. Handle HITL (Human-in-the-loop) interruptions
-5. Post results to GitHub
-
-Architecture
-------------
-FastAPI Route
-      │
-      ▼
-Review Service
-      │
-      ▼
-LangGraph Workflow
-      │
-      ▼
-Database + GitHub API
-
-Error Handling
---------------
-All unexpected errors are wrapped inside CustomException so that the
-API layer can convert them into HTTP responses.
-"""
 
 import sys
 import json
 import uuid
 from datetime import datetime, timezone
-from typing import List, Dict
-
+from typing import List, Dict, Any
+from sqlalchemy.orm import selectinload
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+# Restored Imports
 from app.graph.workflow import review_graph
 from app.graph.state import build_initial_state
-from app.mcp.github_client import GitHubClient
+from app.mcp.github_client import GitHubClient # Restored
 from app.db.models.repository import Repository
 from app.db.models.pull_request import PullRequest
 from app.db.models.review import Review
 from app.db.models.review_step import ReviewStep
 from app.core.exceptions import CustomException
 from app.core.logger import get_logger
+from langgraph.types import Command
+# Add this alongside existing imports
+from app.mcp.sandbox_client import SandboxResult
 
 logger = get_logger(__name__)
 
-
 # ─────────────────────────────────────────────
-# GraphInterrupt import (LangGraph compatibility)
+# GraphInterrupt Handling
 # ─────────────────────────────────────────────
 try:
     from langgraph.errors import GraphInterrupt
@@ -65,425 +35,181 @@ except ImportError:
     try:
         from langgraph.types import GraphInterrupt
     except ImportError:
-        class GraphInterrupt(Exception):
-            pass
-
+        class GraphInterrupt(Exception): pass
 
 # ─────────────────────────────────────────────
-# Helper Functions
+# Helper Functions (Condensed)
 # ─────────────────────────────────────────────
 
-async def _get_or_create_repository(
-    db: AsyncSession,
-    owner: str,
-    repo: str
-) -> Repository:
-    """Fetch repository or create it if missing."""
+def serialize_output(data: Any) -> Any:
+    """Ensure JSON-safe serialization and consistent structure."""
+    if isinstance(data, list):
+        return [serialize_output(item) for item in data]
+    
+    if isinstance(data, SandboxResult):
+        return {
+            "passed": data.passed,
+            "output": data.output,
+            "errors": data.errors,
+            "exit_code": data.exit_code,
+            "tool": data.tool
+        }
 
-    try:
-        result = await db.execute(
-            select(Repository).where(
-                Repository.owner == owner,
-                Repository.name == repo,
-            )
-        )
+    if hasattr(data, "dict"):
+        return data.dict()
 
-        repository = result.scalar_one_or_none()
+    # If it's a basic type, return as is (prevents the "value" wrapping bug)
+    if isinstance(data, (str, int, float, bool)) or data is None:
+        return data
 
-        if repository:
-            return repository
+    return str(data)
 
-        repository = Repository(
-            owner=owner,
-            name=repo,
-            url=f"https://github.com/{owner}/{repo}",
-            default_branch="main",
-        )
+NODE_NAME_MAP = {
+    "diff": "fetch_diff",
+    "issues": "analyze_code",
+    "suggestions": "analyze_code", # Added
+    "lint_result": "lint_check",
+    "patch": "refactor_patch",
+    "validation_result": "validator",
+    "summary": "summary",          # Added
+    "verdict": "final_verdict"     # Added
+}
 
-        db.add(repository)
-        await db.commit()
-        await db.refresh(repository)
+async def _get_or_create_repository(db: AsyncSession, owner: str, repo: str) -> Repository:
+    res = await db.execute(select(Repository).where(Repository.owner == owner, Repository.name == repo))
+    obj = res.scalar_one_or_none()
+    if obj: return obj
+    obj = Repository(owner=owner, name=repo, url=f"https://github.com/{owner}/{repo}", default_branch="main")
+    db.add(obj); await db.commit(); await db.refresh(obj); return obj
 
-        logger.info(
-            "[review_service] Repository created | %s/%s",
-            owner,
-            repo,
-        )
+async def _get_or_create_pull_request(db: AsyncSession, repository: Repository, pr_number: int, metadata: Dict) -> PullRequest:
+    res = await db.execute(select(PullRequest).where(PullRequest.repo_id == repository.id, PullRequest.pr_number == pr_number))
+    pr = res.scalar_one_or_none()
+    if pr:
+        if metadata.get("title"): pr.title = metadata["title"]
+        await db.commit(); return pr
+    pr = PullRequest(repo_id=repository.id, pr_number=pr_number, title=metadata.get("title", "Untitled PR"), 
+                     author=metadata.get("author", "unknown"), branch=metadata.get("head_branch", "unknown"), status="open")
+    db.add(pr); await db.commit(); await db.refresh(pr); return pr
 
-        return repository
-
-    except Exception as e:
-        await db.rollback()
-        logger.error(
-            "[review_service] Repository creation failed",
-            exc_info=True
-        )
-        raise CustomException(str(e), sys)
-
-
-async def _get_or_create_pull_request(
-    db: AsyncSession,
-    repository: Repository,
-    pr_number: int,
-    metadata: Dict,
-) -> PullRequest:
-    """Fetch PR record or create stub."""
-
-    try:
-        result = await db.execute(
-            select(PullRequest).where(
-                PullRequest.repo_id == repository.id,
-                PullRequest.pr_number == pr_number,
-            )
-        )
-
-        pr = result.scalar_one_or_none()
-
-        if pr:
-            if metadata.get("title"):
-                pr.title = metadata["title"]
-
-            if metadata.get("state"):
-                pr.status = metadata["state"]
-
-            await db.commit()
-            return pr
-
-        pr = PullRequest(
-            repo_id=repository.id,
-            pr_number=pr_number,
-            title=metadata.get("title", "Untitled PR"),
-            author=metadata.get("author", "unknown"),
-            branch=metadata.get("head_branch", "unknown"),
-            status=metadata.get("state", "open"),
-        )
-
-        db.add(pr)
-        await db.commit()
-        await db.refresh(pr)
-
-        logger.info(
-            "[review_service] PullRequest created | #%s %s",
-            pr_number,
-            pr.title,
-        )
-
-        return pr
-
-    except Exception as e:
-        await db.rollback()
-        logger.error(
-            "[review_service] PullRequest operation failed",
-            exc_info=True
-        )
-        raise CustomException(str(e), sys)
-
-
-async def _persist_review_steps(
-    db: AsyncSession,
-    review: Review,
-    final_state: Dict,
-) -> None:
-    """Persist workflow steps."""
-
-    now = datetime.now(timezone.utc)
-
-    try:
-        steps = [
-            ReviewStep(
-                review_id=review.id,
-                step_name="fetch_diff",
-                status="completed",
-                input_data=json.dumps({"pr_number": final_state.get("pr_number")}),
-                output_data=json.dumps({
-                    "files_changed": len(final_state.get("files", [])),
-                    "diff_length": len(final_state.get("diff", "")),
-                }),
-                created_at=now,
-            ),
-            ReviewStep(
-                review_id=review.id,
-                step_name="analyze_code",
-                status="completed",
-                input_data=json.dumps({"diff_length": len(final_state.get("diff", ""))}),
-                output_data=json.dumps({
-                    "issues": final_state.get("issues", []),
-                    "suggestions": final_state.get("suggestions", []),
-                }),
-                created_at=now,
-            ),
-            ReviewStep(
-                review_id=review.id,
-                step_name="verdict",
-                status="completed",
-                input_data=json.dumps({}),
-                output_data=json.dumps({
-                    "verdict": final_state.get("verdict")
-                }),
-                created_at=now,
-            ),
-        ]
-
+async def _persist_review_steps(db: AsyncSession, review: Review, state: Dict) -> None:
+    res = await db.execute(select(ReviewStep.step_name).where(ReviewStep.review_id == review.id))
+    existing = {row[0] for row in res.all()}
+    
+    steps = []
+    for key, v in NODE_NAME_MAP.items():
+        if key in state and v not in existing:
+            # We store as raw data now, the API's _safe_parse_json handles the rest
+            val = serialize_output(state[key])
+            steps.append(ReviewStep(
+                review_id=review.id, 
+                step_name=v, 
+                status="completed", 
+                input_data="{}", 
+                output_data=json.dumps(val) if not isinstance(val, str) else val
+            ))
+    
+    if steps:
         db.add_all(steps)
-        await db.commit()
-
-        logger.info(
-            "[review_service] %d workflow steps stored | review_id=%s",
-            len(steps),
-            review.id,
-        )
-
-    except Exception as e:
-        await db.rollback()
-        logger.error(
-            "[review_service] Step persistence failed",
-            exc_info=True
-        )
-        raise CustomException(str(e), sys)
-
+        await db.flush() # Flush keeps the transaction open but pushes changes
 
 # ─────────────────────────────────────────────
 # Core Service Functions
 # ─────────────────────────────────────────────
 
-async def trigger_review(
-    owner: str,
-    repo: str,
-    pr_number: int,
-    db: AsyncSession,
-) -> Review:
-    """
-    Trigger a full PR review workflow.
-
-    Returns
-    -------
-    Review
-        Persisted review object.
-    """
-
-    logger.info(
-        "[review_service] Trigger review | %s/%s#%s",
-        owner,
-        repo,
-        pr_number,
-    )
-
+async def trigger_review(owner: str, repo: str, pr_number: int, db: AsyncSession) -> Review:
+    review = None
     try:
+        state = build_initial_state(owner, repo, pr_number)
+        repo_obj = await _get_or_create_repository(db, owner, repo)
+        pr_obj = await _get_or_create_pull_request(db, repo_obj, pr_number, {})
+        
+        review = Review(pull_request_id=pr_obj.id, reviewer="ai", status="running", thread_id=str(uuid.uuid4()))
+        db.add(review); await db.commit(); await db.refresh(review)
 
-        initial_state = build_initial_state(owner, repo, pr_number)
+        config = {"configurable": {"thread_id": review.thread_id}}
 
-        repository = await _get_or_create_repository(db, owner, repo)
+        try:
+            # Execute the graph
+            final_state = await review_graph.ainvoke(state, config=config)
+        except GraphInterrupt:
+            # 1. Capture the state AT THE MOMENT of interruption
+            # LangGraph stores the state in the checkpointer
+            snapshot = await review_graph.aget_state(config)
+            
+            # 2. Persist steps completed so far
+            await _persist_review_steps(db, review, snapshot.values)
+            
+            # 3. Set correct status
+            review.status = "pending_hitl"
+            await db.commit()
+            return review
 
-        stub_pr = await _get_or_create_pull_request(
-            db,
-            repository,
-            pr_number,
-            {}
-        )
-
-        thread_id = str(uuid.uuid4())
-
-        review = Review(
-            pull_request_id=stub_pr.id,
-            reviewer="ai",
-            status="running",
-            thread_id=thread_id,
-        )
-
-        db.add(review)
-        await db.commit()
-        await db.refresh(review)
-
-        logger.info(
-            "[review_service] Review started | id=%s thread=%s",
-            review.id,
-            thread_id,
-        )
-
-        config = {"configurable": {"thread_id": thread_id}}
-
-        final_state = await review_graph.ainvoke(
-            initial_state,
-            config=config
-        )
-
-        pull_request = await _get_or_create_pull_request(
-            db,
-            repository,
-            pr_number,
-            final_state.get("metadata", {}),
-        )
-
-        review.pull_request_id = pull_request.id
-
+        # IF COMPLETED WITHOUT INTERRUPT:
         await _persist_review_steps(db, review, final_state)
-
         review.verdict = final_state.get("verdict")
         review.summary = final_state.get("summary")
         review.status = "completed"
-
-        await db.commit()
-        await db.refresh(review)
-
-        logger.info(
-            "[review_service] Review completed | id=%s verdict=%s",
-            review.id,
-            review.verdict,
-        )
-
-        if review.verdict != "HUMAN_REJECTED":
-
-            try:
-                github_client = GitHubClient()
-
-                github_client.post_review_comment(
-                    owner,
-                    repo,
-                    pr_number,
-                    final_state.get("summary", ""),
-                )
-
-                logger.info(
-                    "[review_service] GitHub comment posted"
-                )
-
-            except Exception:
-                logger.warning(
-                    "[review_service] GitHub comment failed",
-                    exc_info=True,
-                )
-
-        return review
-
-    except GraphInterrupt:
-
-        logger.info(
-            "[review_service] HITL interrupt | review_id=%s",
-            review.id,
-        )
-
-        review.status = "pending_hitl"
-        await db.commit()
-        await db.refresh(review)
-
-        return review
-
-    except Exception as e:
-
-        await db.rollback()
-
+        
+        # NEW: Post to GitHub on completion
         try:
-            review.status = "failed"
-            await db.commit()
-        except Exception:
-            pass
+            gh = GitHubClient()
+            await gh.post_review_comment(owner, repo, pr_number, review.summary, review.verdict)
+        except:
+            logger.warning("Failed to post to GitHub, but review saved.")
 
-        logger.error(
-            "[review_service] Review execution failed",
-            exc_info=True,
-        )
-
-        raise CustomException(str(e), sys)
-
-
-# ─────────────────────────────────────────────
-# Query Services
-# ─────────────────────────────────────────────
-
-async def get_review(
-    review_id: int,
-    db: AsyncSession,
-) -> Review:
-    """Retrieve a single review."""
-
-    try:
-        result = await db.execute(
-            select(Review).where(Review.id == review_id)
-        )
-
-        review = result.scalar_one_or_none()
-
-        if not review:
-            raise CustomException(
-                f"Review {review_id} not found",
-                sys
-            )
-
+        await db.commit()
         return review
-
     except Exception as e:
-        logger.error("[review_service] get_review failed", exc_info=True)
+        if review: review.status = "failed"; await db.commit()
         raise CustomException(str(e), sys)
 
+async def decide_review(review_id: int, decision: str, db: AsyncSession) -> Review:
+    res = await db.execute(select(Review).where(Review.id == review_id))
+    review = res.scalar_one_or_none()
+    if not review or review.status != "pending_hitl": raise CustomException("Invalid Review State", sys)
+    
+    config = {"configurable": {"thread_id": review.thread_id}}
+    
+    # Resume the graph
+    final_state = await review_graph.ainvoke(Command(resume=decision), config=config)
+    
+    await _persist_review_steps(db, review, final_state)
+    review.verdict = final_state.get("verdict")
+    review.summary = final_state.get("summary")
+    
+    # Final status based on human choice
+    review.status = "completed" if decision == "approved" else "rejected"
+    
+    await db.commit(); await db.refresh(review); return review
 
-async def list_reviews(
-    owner: str,
-    repo: str,
-    db: AsyncSession,
-) -> List[Review]:
-    """List all reviews for a repository."""
+async def get_review(review_id: int, db: AsyncSession) -> Review:
+    res = await db.execute(select(Review).options(selectinload(Review.steps)).where(Review.id == review_id))
+    review = res.scalar_one_or_none()
+    if not review: raise CustomException("Not Found", sys)
+    return review
 
+async def list_all_reviews(db: AsyncSession) -> List[Dict]:
+    res = await db.execute(select(Review, PullRequest, Repository).join(PullRequest).join(Repository).order_by(Review.created_at.desc()))
+    return [{"id": r.id, "status": r.status, "verdict": r.verdict, "repo": f"{repo.owner}/{repo.name}", "pr_number": pr.pr_number, "title": pr.title} for r, pr, repo in res.all()]
+
+async def list_reviews(owner: str, repo: str, db: AsyncSession) -> List[Review]:
+    """List all reviews for a specific repository (required by review.py)."""
     try:
-        result = await db.execute(
-            select(Repository).where(
-                Repository.owner == owner,
-                Repository.name == repo,
-            )
-        )
-
-        repository = result.scalar_one_or_none()
-
+        # Find the repo first
+        res = await db.execute(select(Repository).where(Repository.owner == owner, Repository.name == repo))
+        repository = res.scalar_one_or_none()
         if not repository:
             return []
 
-        result = await db.execute(
+        # Get reviews linked to this repo via PullRequest
+        res = await db.execute(
             select(Review)
             .join(PullRequest, Review.pull_request_id == PullRequest.id)
             .where(PullRequest.repo_id == repository.id)
             .order_by(Review.created_at.desc())
         )
-
-        return result.scalars().all()
-
+        return res.scalars().all()
     except Exception as e:
         logger.error("[review_service] list_reviews failed", exc_info=True)
-        raise CustomException(str(e), sys)
-
-
-async def list_all_reviews(db: AsyncSession) -> List[Dict]:
-    """Return all reviews across repositories."""
-
-    try:
-
-        result = await db.execute(
-            select(Review, PullRequest, Repository)
-            .join(PullRequest, Review.pull_request_id == PullRequest.id)
-            .join(Repository, PullRequest.repo_id == Repository.id)
-            .order_by(Review.created_at.desc())
-        )
-
-        rows = result.all()
-
-        reviews = []
-
-        for review, pr, repo in rows:
-
-            reviews.append({
-                "id": review.id,
-                "status": review.status,
-                "verdict": review.verdict,
-                "summary": review.summary,
-                "thread_id": review.thread_id,
-                "created_at": review.created_at.isoformat() if review.created_at else None,
-                "repo": f"{repo.owner}/{repo.name}",
-                "pr_number": pr.pr_number,
-                "title": pr.title,
-                "author": pr.author,
-                "branch": pr.branch,
-            })
-
-        return reviews
-
-    except Exception as e:
-        logger.error("[review_service] list_all_reviews failed", exc_info=True)
         raise CustomException(str(e), sys)

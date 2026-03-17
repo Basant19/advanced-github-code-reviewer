@@ -131,34 +131,31 @@ def hitl_node(state: ReviewState) -> dict:
     """
     Human-In-The-Loop approval gate.
 
-    This node pauses the graph execution using LangGraph interrupt().
-
-    The graph will remain suspended until an admin approves or rejects
-    the review using the API endpoints:
-
-        POST /reviews/{id}/approve
-        POST /reviews/{id}/reject
-
-    LangGraph resumes execution from this exact checkpoint.
+    The graph pauses using interrupt(). When the workflow resumes,
+    the value passed in Command(resume=...) will be returned by
+    interrupt() and captured as the human decision.
     """
 
-    try:
-        pr_number = state.get("pr_number")
+    pr_number = state.get("pr_number")
 
-        logger.info(
-            "HITL checkpoint reached. Awaiting approval for PR #%s",
-            pr_number,
-        )
+    logger.info(
+        "HITL checkpoint reached. Awaiting approval for PR #%s",
+        pr_number,
+    )
 
-        interrupt(
-            "Review paused. Awaiting human approval via /approve or /reject."
-        )
+    # Pause execution and wait for human decision
+    decision = interrupt(
+        "Review paused. Awaiting human approval via /approve or /reject."
+    )
 
-        return {}
+    logger.info(
+        "HITL resumed with decision='%s' for PR #%s",
+        decision,
+        pr_number,
+    )
 
-    except Exception as e:
-        logger.exception("HITL interrupt failed: %s", e)
-        raise
+    # Store the decision so verdict_node can use it
+    return {"human_decision": decision}
 
 
 # ─────────────────────────────────────────────────────────────

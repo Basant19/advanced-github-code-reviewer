@@ -41,7 +41,7 @@ class ReviewState(TypedDict, total=False):
     repo: str                    # GitHub repo name
     pr_number: int               # Pull request number
     thread_id: str               # LangGraph MemorySaver thread identifier
-
+    refactor_attempts: int       # Number of refactor attempts made so far (max 3)
     # ── Fetched from GitHub (fetch_diff_node) ───────────────────────────────
     metadata: dict               # PR title, author, base/head branch, etc.
     files: list                  # List of changed file paths
