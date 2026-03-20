@@ -1,23 +1,28 @@
 """
 app/mcp/github_client.py
 
-GitHub API Client
-------------------
-Uses PyGithub (uv add PyGithub) to interact with the GitHub REST API.
+Production-Ready GitHub Client
+------------------------------
 
-Methods the agent needs:
-    - get_pr_metadata     → PR title, author, description
-    - get_pr_files        → changed files with patches
-    - get_pr_diff         → single unified diff string for the LLM
-    - post_review_comment → post AI verdict back to the PR
+Features:
+✔ Safe GitHub API access via PyGithub
+✔ Strong error handling with CustomException
+✔ Structured logging with context
+✔ Defensive handling of missing/large patches
+✔ No silent failures
+✔ Clear method contracts
 
-Note on config attribute name:
-    config.py defines:  github_token: str = Field(..., alias="GITHUB_TOKEN")
-    So the correct access is:  settings.github_token  (lowercase)
-    NOT:                       settings.GITHUB_TOKEN
+Used by:
+- nodes.py (fetch_diff_node)
+- review_service.py (posting comments)
+
+ENV REQUIREMENT:
+    GITHUB_TOKEN must be set (via config settings.github_token)
 """
 
 import sys
+from typing import List, Dict
+
 from github import Github, GithubException
 
 from app.core.config import settings
@@ -27,124 +32,238 @@ from app.core.logger import get_logger
 logger = get_logger(__name__)
 
 
+# ─────────────────────────────────────────────
+# CONSTANTS
+# ─────────────────────────────────────────────
+
+MAX_DIFF_SIZE = 20000  # prevent extremely large LLM input
+
+
+# ─────────────────────────────────────────────
+# CLIENT
+# ─────────────────────────────────────────────
+
 class GitHubClient:
+    """
+    Wrapper around PyGithub with:
+    - Consistent logging
+    - Controlled exceptions
+    - Clean API surface for graph nodes
+    """
 
-    def __init__(self):
-        self.client = Github(settings.github_token)   # ← lowercase, matches config.py
-        logger.info("GitHubClient initialized")
+    def __init__(self) -> None:
+        try:
+            if not settings.github_token:
+                raise ValueError("Missing GitHub token")
 
-    # ── internal helpers ───────────────────────────────────────────────────
+            self.client = Github(settings.github_token)
+
+            logger.info(
+                "[GitHubClient] Initialized successfully",
+                extra={"auth": "token_present"},
+            )
+
+        except Exception as e:
+            logger.exception("[GitHubClient] Initialization failed")
+            raise CustomException("GitHub client initialization failed", sys) from e
+
+    # ─────────────────────────────────────────
+    # INTERNAL HELPERS
+    # ─────────────────────────────────────────
 
     def _get_repo(self, owner: str, repo: str):
-        """Return a PyGithub Repository or raise CustomException."""
+        """
+        Fetch repository safely.
+
+        Raises:
+            CustomException if repo not found / API error
+        """
         try:
-            return self.client.get_repo(f"{owner}/{repo}")
-        except GithubException as e:
-            logger.error(f"Repository not found: {owner}/{repo} — {e.status}")
-            raise CustomException(
-                f"Repository {owner}/{repo} not found: {e.data}", sys
+            full_name = f"{owner}/{repo}"
+
+            logger.debug(
+                "[GitHub] Fetching repository",
+                extra={"repo": full_name},
             )
+
+            return self.client.get_repo(full_name)
+
+        except GithubException as e:
+            logger.error(
+                "[GitHub] Repository fetch failed",
+                extra={"repo": f"{owner}/{repo}", "status": e.status},
+                exc_info=True,
+            )
+            raise CustomException(
+                f"Repository {owner}/{repo} not found", sys
+            ) from e
+
+        except Exception as e:
+            logger.exception("[GitHub] Unexpected repo error")
+            raise CustomException("Unexpected GitHub error", sys) from e
 
     def _get_pr(self, owner: str, repo: str, pr_number: int):
-        """Return a PyGithub PullRequest or raise CustomException."""
+        """
+        Fetch pull request safely.
+        """
         repo_obj = self._get_repo(owner, repo)
+
         try:
-            return repo_obj.get_pull(pr_number)
-        except GithubException as e:
-            logger.error(f"PR #{pr_number} not found in {owner}/{repo} — {e.status}")
-            raise CustomException(
-                f"PR #{pr_number} not found in {owner}/{repo}: {e.data}", sys
+            logger.debug(
+                "[GitHub] Fetching PR",
+                extra={"repo": f"{owner}/{repo}", "pr": pr_number},
             )
 
-    # ── public methods ─────────────────────────────────────────────────────
+            return repo_obj.get_pull(pr_number)
 
-    def get_pr_metadata(self, owner: str, repo: str, pr_number: int) -> dict:
-        """
-        Returns basic PR information the agent uses for context.
-
-        Returns:
-            {
-                "number":      int,
-                "title":       str,
-                "author":      str,
-                "description": str,
-                "base_branch": str,
-                "head_branch": str,
-                "state":       str,   # "open" | "closed" | "merged"
-            }
-        """
-        logger.info(f"Fetching PR metadata: {owner}/{repo}#{pr_number}")
-
-        pr = self._get_pr(owner, repo, pr_number)
-        metadata = {
-            "number":      pr.number,
-            "title":       pr.title,
-            "author":      pr.user.login,
-            "description": pr.body or "",
-            "base_branch": pr.base.ref,
-            "head_branch": pr.head.ref,
-            "state":       "merged" if pr.merged else pr.state,
-        }
-
-        logger.info(
-            f"PR metadata fetched — title: '{pr.title}', author: {pr.user.login}"
-        )
-        return metadata
-
-    def get_pr_files(self, owner: str, repo: str, pr_number: int) -> list[dict]:
-        """
-        Returns the list of files changed in the PR.
-
-        Returns:
-            [
-                {
-                    "filename": str,
-                    "status":   str,   # "added" | "modified" | "removed"
-                    "changes":  int,
-                    "patch":    str,   # unified diff for this file
+        except GithubException as e:
+            logger.error(
+                "[GitHub] PR fetch failed",
+                extra={
+                    "repo": f"{owner}/{repo}",
+                    "pr": pr_number,
+                    "status": e.status,
                 },
-                ...
-            ]
+                exc_info=True,
+            )
+            raise CustomException(
+                f"PR #{pr_number} not found in {owner}/{repo}", sys
+            ) from e
+
+        except Exception as e:
+            logger.exception("[GitHub] Unexpected PR error")
+            raise CustomException("Unexpected GitHub error", sys) from e
+
+    # ─────────────────────────────────────────
+    # PUBLIC METHODS
+    # ─────────────────────────────────────────
+
+    def get_pr_metadata(self, owner: str, repo: str, pr_number: int) -> Dict:
         """
-        logger.info(f"Fetching PR files: {owner}/{repo}#{pr_number}")
+        Fetch PR metadata for context.
 
-        pr = self._get_pr(owner, repo, pr_number)
-        result = [
-            {
-                "filename": f.filename,
-                "status":   f.status,
-                "changes":  f.changes,
-                "patch":    f.patch or "",    # binary files have no patch
+        Returns:
+            dict
+        """
+        logger.info(
+            "[GitHub] Fetching PR metadata",
+            extra={"repo": f"{owner}/{repo}", "pr": pr_number},
+        )
+
+        try:
+            pr = self._get_pr(owner, repo, pr_number)
+
+            metadata = {
+                "number": pr.number,
+                "title": pr.title or "",
+                "author": getattr(pr.user, "login", "unknown"),
+                "description": pr.body or "",
+                "base_branch": pr.base.ref,
+                "head_branch": pr.head.ref,
+                "state": "merged" if pr.merged else pr.state,
             }
-            for f in pr.get_files()
-        ]
 
-        logger.info(f"Fetched {len(result)} changed file(s) for PR #{pr_number}")
-        return result
+            logger.debug(
+                "[GitHub] Metadata fetched",
+                extra={"title": metadata["title"]},
+            )
+
+            return metadata
+
+        except Exception as e:
+            logger.exception("[GitHub] Metadata fetch failed")
+            raise CustomException("Failed to fetch PR metadata", sys) from e
+
+    # ─────────────────────────────────────────
+
+    def get_pr_files(self, owner: str, repo: str, pr_number: int) -> List[Dict]:
+        """
+        Fetch changed files in PR.
+
+        Returns:
+            List[dict]
+        """
+        logger.info(
+            "[GitHub] Fetching PR files",
+            extra={"repo": f"{owner}/{repo}", "pr": pr_number},
+        )
+
+        try:
+            pr = self._get_pr(owner, repo, pr_number)
+
+            files = []
+            for f in pr.get_files():
+                files.append({
+                    "filename": f.filename,
+                    "status": f.status,
+                    "changes": f.changes,
+                    "patch": f.patch or "",
+                })
+
+            logger.info(
+                "[GitHub] Files fetched",
+                extra={"count": len(files)},
+            )
+
+            return files
+
+        except Exception as e:
+            logger.exception("[GitHub] File fetch failed")
+            raise CustomException("Failed to fetch PR files", sys) from e
+
+    # ─────────────────────────────────────────
 
     def get_pr_diff(self, owner: str, repo: str, pr_number: int) -> str:
         """
-        Builds a single unified diff string from all changed files.
-        This is passed directly to the LLM for code analysis.
+        Build unified diff string for LLM.
 
-        Returns:
-            str — concatenated patches for every changed file
+        Safety:
+        - Skips empty patches
+        - Truncates large diffs
         """
-        logger.info(f"Building unified diff: {owner}/{repo}#{pr_number}")
-
-        files = self.get_pr_files(owner, repo, pr_number)
-        diff_parts = [
-            f"--- {f['filename']} ({f['status']})\n{f['patch']}"
-            for f in files
-            if f["patch"]
-        ]
-
-        diff = "\n\n".join(diff_parts)
         logger.info(
-            f"Diff built — {len(diff_parts)} file(s) with patches, "
-            f"{len(diff)} chars total"
+            "[GitHub] Building PR diff",
+            extra={"repo": f"{owner}/{repo}", "pr": pr_number},
         )
-        return diff
+
+        try:
+            files = self.get_pr_files(owner, repo, pr_number)
+
+            diff_parts = []
+
+            for f in files:
+                if not f["patch"]:
+                    continue
+
+                diff_parts.append(
+                    f"--- {f['filename']} ({f['status']})\n{f['patch']}"
+                )
+
+            diff = "\n\n".join(diff_parts)
+
+            if not diff:
+                logger.warning("[GitHub] Empty diff generated")
+
+            # 🔥 SIZE CONTROL
+            if len(diff) > MAX_DIFF_SIZE:
+                logger.warning(
+                    "[GitHub] Diff too large → truncating",
+                    extra={"original_size": len(diff)},
+                )
+                diff = diff[:MAX_DIFF_SIZE]
+
+            logger.info(
+                "[GitHub] Diff ready",
+                extra={"size": len(diff)},
+            )
+
+            return diff
+
+        except Exception as e:
+            logger.exception("[GitHub] Diff build failed")
+            raise CustomException("Failed to build PR diff", sys) from e
+
+    # ─────────────────────────────────────────
 
     def post_review_comment(
         self,
@@ -154,19 +273,40 @@ class GitHubClient:
         body: str,
     ) -> None:
         """
-        Posts the AI review as a comment on the GitHub PR.
+        Post review comment to PR.
 
-        Args:
-            body: Formatted review text (verdict + issues + suggestions).
+        Raises:
+            CustomException on failure
         """
-        logger.info(f"Posting review comment to {owner}/{repo}#{pr_number}")
+        logger.info(
+            "[GitHub] Posting review comment",
+            extra={"repo": f"{owner}/{repo}", "pr": pr_number},
+        )
 
-        pr = self._get_pr(owner, repo, pr_number)
         try:
+            pr = self._get_pr(owner, repo, pr_number)
+
+            if not body or not body.strip():
+                logger.warning("[GitHub] Empty comment body — skipping")
+                return
+
             pr.create_issue_comment(body)
-            logger.info(f"Review comment posted successfully to PR #{pr_number}")
-        except GithubException as e:
-            logger.error(f"Failed to post comment on PR #{pr_number} — {e.status}")
-            raise CustomException(
-                f"Failed to post review comment on PR #{pr_number}: {e.data}", sys
+
+            logger.info(
+                "[GitHub] Comment posted successfully",
+                extra={"pr": pr_number},
             )
+
+        except GithubException as e:
+            logger.error(
+                "[GitHub] Comment failed",
+                extra={"status": e.status},
+                exc_info=True,
+            )
+            raise CustomException(
+                f"Failed to post review comment on PR #{pr_number}", sys
+            ) from e
+
+        except Exception as e:
+            logger.exception("[GitHub] Unexpected comment error")
+            raise CustomException("Unexpected GitHub error", sys) from e

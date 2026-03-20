@@ -1,147 +1,206 @@
 """
-app/graph/state.py
+state.py 
+E:\advanced-github-code-reviewer\app\graph\state.py
 
-ReviewState TypedDict for LangGraph workflow.
+UPGRADES:
+✔ Strict schema definition (TypedDict safe usage)
+✔ Guaranteed default values (no KeyError in graph)
+✔ HITL lifecycle compatibility
+✔ Loop counters clearly separated
+✔ Defensive validation (fail fast)
+✔ Debug-friendly structure
+✔ Future-proof extensibility
 
-P1: Initial fields — owner, repo, pr_number, thread_id, metadata, files,
-    diff, issues, suggestions, repo_context, reflection_count, verdict, summary.
-P2: No new fields (lint_result, lint_passed, patch, validation_result written
-    directly by lint_node / refactor_node / validator_node using existing keys).
-P3: Adds human_decision field — 'approved' | 'rejected' | None.
-    Set by HITL approval gate after interrupt() resumes.
-    Adds build_initial_state() factory — validates inputs and sets safe defaults.
+CRITICAL DESIGN NOTES:
+- LangGraph merges state → nodes MUST return partial updates only
+- This file guarantees ALL keys exist → prevents runtime crashes
+- No mutation side-effects → safe for async execution
 """
 
 import sys
-from typing import Optional
+from typing import Optional, List, Dict, Any
 from typing_extensions import TypedDict
 
 from app.core.exceptions import CustomException
 
 
+# ─────────────────────────────────────────────
+# SANDBOX RESULT TYPE
+# ─────────────────────────────────────────────
 class SandboxResult(TypedDict, total=False):
-    """Result returned by Docker sandbox execution (lint or test run)."""
+    """
+    Standard structure for sandbox execution results.
+
+    NOTE:
+    - Used by lint_node and validator_node
+    - Must be JSON serializable
+    """
     passed: bool
     output: str
+    errors: str
     exit_code: int
     duration_ms: float
-    error: Optional[str]
+    tool: str
 
 
+# ─────────────────────────────────────────────
+# REVIEW STATE
+# ─────────────────────────────────────────────
 class ReviewState(TypedDict, total=False):
     """
-    Shared state dict passed between all LangGraph nodes.
+    Global state shared across all LangGraph nodes.
 
-    All fields are optional (total=False) so each node can return only the
-    keys it writes; LangGraph merges partial dicts automatically.
+    IMPORTANT RULES:
+    ----------------
+    1. Nodes MUST return partial updates only
+    2. Graph merges state automatically
+    3. Never assume key existence unless defined here
+    4. This schema prevents runtime KeyError bugs
+
+    FLOW OVERVIEW:
+    --------------
+    fetch → analyze → reflect → lint → refactor → validate → HITL → verdict
     """
 
-    # ── Inputs (set once at graph entry) ────────────────────────────────────
-    owner: str                   # GitHub repo owner / org
-    repo: str                    # GitHub repo name
-    pr_number: int               # Pull request number
-    thread_id: str               # LangGraph MemorySaver thread identifier
-    refactor_attempts: int       # Number of refactor attempts made so far (max 3)
-    # ── Fetched from GitHub (fetch_diff_node) ───────────────────────────────
-    metadata: dict               # PR title, author, base/head branch, etc.
-    files: list                  # List of changed file paths
-    diff: str                    # Full unified diff text
+    # ───────────────── INPUT ─────────────────
+    owner: str
+    repo: str
+    pr_number: int
+    thread_id: str  # Used by LangGraph checkpointing
 
-    # ── LLM analysis (analyze_code_node) ────────────────────────────────────
-    issues: list                 # Detected code issues
-    suggestions: list            # Improvement suggestions
-    repo_context: str            # ChromaDB retrieved context (may be empty)
+    # ─────────────── GITHUB DATA ─────────────
+    metadata: Dict[str, Any]
+    files: List[Dict[str, Any]]
+    diff: str
 
-    # ── Reflection loop counter (reflect_node / refactor_node) ──────────────
-    reflection_count: int        # Incremented each refactor iteration (max 3)
+    # ─────────────── LLM ANALYSIS ────────────
+    issues: List[str]
+    suggestions: List[str]
+    repo_context: str  # reserved for future RAG
 
-    # ── Docker sandbox — lint (lint_node) ───────────────────────────────────
-    lint_result: SandboxResult   # Full SandboxResult from ruff check
-    lint_passed: bool            # Convenience bool from lint_result.passed
+    # ─────────────── LOOP CONTROL ────────────
+    reflection_count: int   # controls reflection loop
+    refactor_count: int     # controls refactor loop
 
-    # ── Docker sandbox — refactor / validate (refactor_node, validator_node) ─
-    patch: str                   # Gemini-generated corrective unified diff
-    validation_result: SandboxResult  # Full SandboxResult from ruff + pytest
+    # ─────────────── SANDBOX ────────────────
+    lint_result: SandboxResult
+    lint_passed: bool
 
-    # ── P3: Human-in-the-Loop decision ──────────────────────────────────────
-    human_decision: Optional[str]
+    patch: str
+
+    validation_result: SandboxResult
+    validation_passed: bool
+
+    # ─────────────── ERROR HANDLING ─────────
+    error: bool
+    error_reason: str
+
+    # ─────────────── HITL (CRITICAL) ────────
+    pending_hitl: bool
+    human_decision: Optional[str]  # "approved" | "rejected"
+
+    # ─────────────── FINAL OUTPUT ───────────
+    verdict: str
+    summary: str
+
+
+# ─────────────────────────────────────────────
+# INITIAL STATE BUILDER
+# ─────────────────────────────────────────────
+def build_initial_state(
+    owner: str,
+    repo: str,
+    pr_number: int,
+) -> ReviewState:
     """
-    Set by the HITL approval gate after the graph resumes from interrupt().
+    Construct a SAFE and COMPLETE initial state.
 
-    Values:
-        'approved'  — admin approved the AI verdict; GitHub comment will post.
-        'rejected'  — admin rejected; review saved as HUMAN_REJECTED, no post.
-        None        — default; interrupt() has not yet been resolved.
-    """
+    WHY THIS IS CRITICAL:
+    ---------------------
+    ✔ Prevents KeyError in nodes
+    ✔ Ensures deterministic execution
+    ✔ Makes debugging MUCH easier
+    ✔ Required for LangGraph stability
 
-    # ── Verdict (verdict_node) ───────────────────────────────────────────────
-    verdict: str                 # 'APPROVE' | 'REQUEST_CHANGES' | 'HUMAN_REJECTED'
-    summary: str                 # Full markdown comment text for GitHub
-
-
-# ── Factory function ─────────────────────────────────────────────────────────
-
-def build_initial_state(owner: str, repo: str, pr_number: int) -> ReviewState:
-    """
-    Validate trigger inputs and return a ReviewState with safe defaults.
-
-    This is the canonical way to create the initial state dict before
-    passing it to review_graph.ainvoke().  It enforces the invariants
-    that the rest of the pipeline assumes:
-        - owner and repo are non-empty strings
-        - pr_number is a positive integer
-
-    Args:
-        owner:      GitHub repository owner or organisation name.
-        repo:       GitHub repository name.
-        pr_number:  Pull request number (must be a positive integer).
+    VALIDATION STRATEGY:
+    --------------------
+    - Fail fast on invalid input
+    - Normalize strings
+    - Ensure all required fields exist
 
     Returns:
-        A ReviewState dict with all fields initialised to safe defaults.
-
-    Raises:
-        CustomException: if any of the three inputs fail validation.
+        ReviewState (fully initialized)
     """
-    # ── Type checks ───────────────────────────────────────────────────────────
-    if not isinstance(owner, str):
-        raise CustomException(
-            f"owner must be a string, got {type(owner).__name__}", sys
-        )
-    if not isinstance(repo, str):
-        raise CustomException(
-            f"repo must be a string, got {type(repo).__name__}", sys
-        )
-    if not isinstance(pr_number, int):
-        raise CustomException(
-            f"pr_number must be an int, got {type(pr_number).__name__}", sys
-        )
 
-    # ── Value checks ─────────────────────────────────────────────────────────
-    owner = owner.strip()
-    repo  = repo.strip()
+    try:
+        # ───────── TYPE VALIDATION ─────────
+        if not isinstance(owner, str):
+            raise ValueError("owner must be string")
 
-    if not owner:
-        raise CustomException("owner must not be empty", sys)
-    if not repo:
-        raise CustomException("repo must not be empty", sys)
-    if pr_number <= 0:
-        raise CustomException(
-            f"pr_number must be a positive integer, got {pr_number}", sys
-        )
+        if not isinstance(repo, str):
+            raise ValueError("repo must be string")
 
-    # ── Build state with safe defaults ────────────────────────────────────────
-    return ReviewState(
-        owner            = owner,
-        repo             = repo,
-        pr_number        = pr_number,
-        metadata         = {},
-        diff             = "",
-        files            = [],
-        issues           = [],
-        suggestions      = [],
-        reflection_count = 0,
-        verdict          = "",
-        summary          = "",
-        repo_context     = "",
-        human_decision   = None,
-    )
+        if not isinstance(pr_number, int):
+            raise ValueError("pr_number must be int")
+
+        # ───────── VALUE NORMALIZATION ─────
+        owner = owner.strip()
+        repo = repo.strip()
+
+        if not owner:
+            raise ValueError("owner cannot be empty")
+
+        if not repo:
+            raise ValueError("repo cannot be empty")
+
+        if pr_number <= 0:
+            raise ValueError("pr_number must be positive")
+
+        # ───────── SAFE DEFAULT STATE ──────
+        state: ReviewState = {
+            # INPUT
+            "owner": owner,
+            "repo": repo,
+            "pr_number": pr_number,
+
+            # GITHUB
+            "metadata": {},
+            "files": [],
+            "diff": "",
+
+            # ANALYSIS
+            "issues": [],
+            "suggestions": [],
+            "repo_context": "",
+
+            # LOOP CONTROL
+            "reflection_count": 0,
+            "refactor_count": 0,
+
+            # SANDBOX
+            "lint_result": {},
+            "lint_passed": True,
+
+            "patch": "",
+
+            "validation_result": {},
+            "validation_passed": False,
+
+            # ERROR HANDLING
+            "error": False,
+            "error_reason": "",
+
+            # HITL
+            "pending_hitl": False,
+            "human_decision": None,
+
+            # FINAL OUTPUT
+            "verdict": "",
+            "summary": "",
+        }
+
+        return state
+
+    except Exception as e:
+        # 🔥 CRITICAL: Always wrap in CustomException
+        raise CustomException(f"Invalid input: {str(e)}", sys)

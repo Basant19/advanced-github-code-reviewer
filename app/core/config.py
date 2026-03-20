@@ -58,7 +58,7 @@ class Settings(BaseSettings):
 
     # ── Application ───────────────────────────────────────────────────────────
     app_name:    str  = "Advanced GitHub Code Reviewer"
-    environment: str  = "development"
+    ENVIRONMENT: str  = "development"
     debug:       bool = True
 
     # ── AI / Model Keys ───────────────────────────────────────────────────────
@@ -66,7 +66,7 @@ class Settings(BaseSettings):
     tavily_api_key: str = Field(..., alias="TAVILY_API_KEY")
 
     # ── LangSmith ─────────────────────────────────────────────────────────────
-    langsmith_tracing: bool = Field(default=False, alias="LANGSMITH_TRACING")
+    LANGSMITH_TRACING: bool = Field(default=False, alias="LANGSMITH_TRACING")
     langsmith_project: str  = Field(
         default="advanced-github-code-reviewer",
         alias="LANGSMITH_PROJECT",
@@ -111,14 +111,14 @@ try:
     os.environ["GOOGLE_API_KEY"]       = settings.google_api_key
     os.environ["LANGSMITH_API_KEY"]    = settings.langsmith_api_key
     os.environ["LANGCHAIN_API_KEY"]    = settings.langsmith_api_key   # LangChain alias
-    os.environ["LANGCHAIN_TRACING_V2"] = str(settings.langsmith_tracing).lower()
+    os.environ["LANGCHAIN_TRACING_V2"] = str(settings.LANGSMITH_TRACING).lower()
     os.environ["LANGCHAIN_PROJECT"]    = settings.langsmith_project
 
     logger.info("Application configuration loaded successfully")
-    logger.info(f"Environment            : {settings.environment}")
+    logger.info(f"Environment            : {settings.ENVIRONMENT}")
     logger.info(f"GOOGLE_API_KEY loaded  : {bool(settings.google_api_key)}")
     logger.info(f"GITHUB_TOKEN loaded    : {bool(settings.github_token)}")
-    logger.info(f"LANGSMITH tracing      : {settings.langsmith_tracing}")
+    logger.info(f"LANGSMITH tracing      : {settings.LANGSMITH_TRACING}")
     logger.info(f"DATABASE_URL loaded    : {bool(settings.DATABASE_URL)}")
 
 except Exception as e:
