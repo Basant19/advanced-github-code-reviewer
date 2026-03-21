@@ -70,7 +70,131 @@ from app.core.logger import get_logger
 
 logger = get_logger(__name__)
 
+# Add at top of file
+import time
+import uuid
+from collections import deque
 
+# ── Burst Tracking ───────────────────────────────────────────────────────────
+
+LLM_CALL_HISTORY = deque(maxlen=100)
+"""Stores timestamps of recent LLM calls for burst detection."""
+
+
+def _record_llm_call():
+    now = time.time()
+    LLM_CALL_HISTORY.append(now)
+
+    # Count calls in last 10 seconds
+    window = 10
+    count = sum(1 for t in LLM_CALL_HISTORY if now - t <= window)
+
+    return count
+
+
+# ── Safe LLM Invocation (Instrumented) ───────────────────────────────────────
+
+async def safe_llm_invoke(messages: List[Any]) -> str:
+    call_id = str(uuid.uuid4())[:8]
+    start_time = time.time()
+
+    logger.info(
+        "[LLM][%s] REQUEST_START | queued_for_semaphore | msg_count=%d",
+        call_id,
+        len(messages),
+    )
+
+    # Track queue wait time
+    queue_start = time.time()
+
+    async with LLM_SEMAPHORE:
+        queue_wait = time.time() - queue_start
+
+        # Burst tracking
+        burst_count = _record_llm_call()
+
+        logger.info(
+            "[LLM][%s] ACQUIRED | queue_wait=%.2fs | concurrent_limit=%d | burst_last_10s=%d",
+            call_id,
+            queue_wait,
+            LLM_SEMAPHORE._value,  # remaining slots
+            burst_count,
+        )
+
+        try:
+            llm = get_llm()
+
+            invoke_start = time.time()
+
+            logger.info(
+                "[LLM][%s] INVOKE_START | timeout=%ds",
+                call_id,
+                LLM_TIMEOUT,
+            )
+
+            response = await asyncio.wait_for(
+                llm.ainvoke(messages),
+                timeout=LLM_TIMEOUT,
+            )
+
+            invoke_time = time.time() - invoke_start
+            total_time = time.time() - start_time
+
+            logger.info(
+                "[LLM][%s] SUCCESS | invoke_time=%.2fs | total_time=%.2fs",
+                call_id,
+                invoke_time,
+                total_time,
+            )
+
+            # ── Cooldown to prevent burst ─────────────────────────────
+            cooldown = 2
+            logger.info(
+                "[LLM][%s] COOLDOWN | sleeping=%ds to prevent RPM burst",
+                call_id,
+                cooldown,
+            )
+            await asyncio.sleep(cooldown)
+
+            return response.content
+
+        except asyncio.TimeoutError:
+            total_time = time.time() - start_time
+
+            logger.error(
+                "[LLM][%s] TIMEOUT | exceeded=%ds | total_time=%.2fs",
+                call_id,
+                LLM_TIMEOUT,
+                total_time,
+            )
+            return LLM_ERROR
+
+        except Exception as e:
+            total_time = time.time() - start_time
+            error_str = str(e)
+
+            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                logger.error(
+                    "[LLM][%s] RATE_LIMIT | 429 hit | total_time=%.2fs | "
+                    "sleeping=60s before returning FREE_TIER_EXHAUSTED",
+                    call_id,
+                    total_time,
+                )
+
+                await asyncio.sleep(60)
+
+                return FREE_TIER_EXHAUSTED
+
+            logger.exception(
+                "[LLM][%s] FAILURE | total_time=%.2fs | error=%s",
+                call_id,
+                total_time,
+                error_str,
+            )
+            return LLM_ERROR
+
+        finally:
+            logger.info("[LLM][%s] REQUEST_END", call_id)
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 LLM_TIMEOUT: int = 30
@@ -142,19 +266,18 @@ def get_llm() -> ChatGoogleGenerativeAI:
         raise CustomException("GOOGLE_API_KEY is not set in environment", sys)
 
     logger.info(
-        "[nodes] Initializing Gemini LLM — model=gemini-2.0-flash "
-        "max_retries=0 temperature=0"
-    )
-
+    "[nodes] Initializing Gemini LLM — "
+    "model=gemini-2.5-flash-lite max_retries=0 temperature=0"
+)
+    
     _llm_instance = ChatGoogleGenerativeAI(
-        model="gemini-2.0-flash-lite",
+        model="gemini-2.5-flash-lite",
         temperature=0,
         max_retries=0,
     )
 
     logger.info("[nodes] Primary LLM initialized")
     return _llm_instance
-
 
 # ── Sandbox Initialization ────────────────────────────────────────────────────
 
@@ -187,71 +310,6 @@ def get_sandbox():
         sandbox_client = None
 
     return sandbox_client
-
-
-# ── Safe LLM Invocation ───────────────────────────────────────────────────────
-
-async def safe_llm_invoke(messages: List[Any]) -> str:
-    """
-    Invoke the Gemini LLM with timeout and quota protection.
-
-    This is the single call site for all LLM invocations in the graph.
-    It guarantees:
-        - Graph never crashes on LLM failure
-        - Free-tier quota errors are detected instantly (no retry storm)
-        - Hard timeout prevents runaway async tasks
-        - Concurrent calls are bounded by LLM_SEMAPHORE
-
-    Parameters
-    ----------
-    messages : List[Any]
-        LangChain message list (SystemMessage + HumanMessage).
-
-    Returns
-    -------
-    str
-        One of:
-        - Normal LLM response content
-        - FREE_TIER_EXHAUSTED  (on 429 quota error)
-        - LLM_ERROR            (on timeout or other failure)
-    """
-    async with LLM_SEMAPHORE:
-        try:
-            logger.info("[LLM] Invoking Gemini — waiting for response")
-
-            llm = get_llm()
-
-            response = await asyncio.wait_for(
-                llm.ainvoke(messages),
-                timeout=LLM_TIMEOUT,
-            )
-
-            logger.info("[LLM] Response received successfully")
-            return response.content
-
-        except asyncio.TimeoutError:
-            logger.error(
-                "[LLM] Call timed out after %ds — returning LLM_ERROR",
-                LLM_TIMEOUT,
-            )
-            return LLM_ERROR
-
-        except Exception as e:
-            error_str = str(e)
-
-            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-                logger.error(
-                    "[LLM] Free tier quota exhausted (429) — "
-                    "returning FREE_TIER_EXHAUSTED. "
-                    "Wait until quota resets or add billing."
-                )
-                return FREE_TIER_EXHAUSTED
-
-            logger.exception(
-                "[LLM] Unexpected failure — returning LLM_ERROR. error=%s",
-                error_str,
-            )
-            return LLM_ERROR
 
 
 # ── Output Parser ─────────────────────────────────────────────────────────────
