@@ -1,69 +1,93 @@
 """
 app/graph/workflow.py
 
-LangGraph Workflow Definition — P3 Production Version
+LangGraph Workflow Definition — P4 Production Version
 ------------------------------------------------------
 Defines the complete review pipeline as a stateful directed graph.
 
-Graph Flow
-----------
+Graph Flow (P4)
+---------------
 START
   → fetch_diff_node
-  → analyze_code_node
-  → lint_node             (reflection skipped — REFLECTION_PASSES=0)
-  → refactor_node         (conditional — only if lint fails)
-  → validator_node        (conditional — only if refactor runs)
+  → retrieve_context_node  ★ P4 — query ChromaDB for similar code chunks
+  → grade_context_node     ★ P4 — CRAG: grade relevance of retrieved context
+  → analyze_code_node          — Gemini analysis (with graded context if relevant)
+  → reflect_node               — self-reflection (REFLECTION_PASSES=0 in dev)
+  → lint_node                  — ruff in Docker sandbox
+  → refactor_node              — Gemini corrective patch (conditional)
+  → validator_node             — ruff + pytest in Docker (conditional)
+  → memory_write_node      ★ P4 — write findings to ChromaDB long-term memory
   → [PAUSE: interrupt_before hitl_node]
-  → hitl_node             (reads human_decision injected via Command(resume=))
-  → verdict_node
+  → hitl_node                  — human decision gate
+  → verdict_node               — final verdict + GitHub comment markdown
   → END
+
+P4 RAG Pipeline
+---------------
+retrieve_context_node queries ChromaDB using the PR diff as the search vector.
+If ChromaDB is empty (before POST /repos/index is called), raw_context is "".
+
+grade_context_node (CRAG pattern) asks Gemini whether the retrieved context
+is actually relevant to this PR. Grades: "yes" | "no" | "skipped".
+If "yes" → repo_context injected into analyze_code_node prompt.
+If "no"  → repo_context="" (irrelevant context discarded).
+If LLM fails → fails open (context passed through unchanged).
+
+memory_write_node runs AFTER validation, BEFORE hitl_node.
+It writes review findings to ChromaDB so future reviews on the same repo
+benefit from accumulated review history.
+
+Routing After RAG Nodes
+-----------------------
+check_rag_error() routes after grade_context_node:
+    error → hitl_node (skip remaining nodes)
+    ok    → analyze_code_node
+
+check_error() routes after analyze_code_node:
+    error → hitl_node
+    ok    → reflect_node or lint_node (based on REFLECTION_PASSES)
 
 Reflection Loop
 ---------------
 REFLECTION_PASSES controls how many self-reflection passes run after
-analyze_code_node. Set to 0 for development to conserve free-tier quota
-(1 LLM call per review total). Set to 1 or 2 for production.
+analyze_code_node. Set to 0 in development to conserve free-tier quota.
 
-    REFLECTION_PASSES = 0  → analyze → lint          (1 LLM call)
-    REFLECTION_PASSES = 1  → analyze → reflect → lint (2 LLM calls)
-    REFLECTION_PASSES = 2  → analyze → reflect × 2 → lint (3 LLM calls)
+    REFLECTION_PASSES = 0  → 1 LLM call  (analyze only)
+    REFLECTION_PASSES = 1  → 2 LLM calls (analyze + reflect)
+    REFLECTION_PASSES = 2  → 3 LLM calls (analyze + reflect×2)
+
+P4 LLM Call Budget
+------------------
+With REFLECTION_PASSES=0 and non-empty ChromaDB:
+    grade_context_node  : 1 call  (grades retrieved context)
+    analyze_code_node   : 1 call  (main analysis)
+    TOTAL               : 2 calls per review
+
+With REFLECTION_PASSES=0 and empty ChromaDB (skips grading):
+    analyze_code_node   : 1 call
+    TOTAL               : 1 call per review
+
+Free tier: 20 RPD on gemini-2.5-flash-lite.
+At 2 calls/review: 10 reviews/day with RAG active.
+At 1 call/review:  20 reviews/day without RAG (empty ChromaDB).
 
 HITL Design
 -----------
 interrupt_before=["hitl_node"] is the ONLY correct mechanism for pausing.
-It tells LangGraph to checkpoint state and raise GraphInterrupt BEFORE
-hitl_node executes. The node itself is only executed on resume.
-
-On first astream():
-    Graph runs fetch → analyze → [reflect×N] → lint → [refactor] → PAUSE
-    astream() stops yielding — no Python exception is raised.
-    review_service detects pause via snapshot.next being non-empty.
-    Review status set to pending_hitl.
+astream() stops yielding when the graph reaches hitl_node.
+No Python exception is raised — pause detected via snapshot.next.
+review_service.trigger_review() checks snapshot.next after stream ends.
 
 On resume via Command(resume="approved" | "rejected"):
     Graph resumes from MemorySaver checkpoint.
     hitl_node executes — interrupt() returns the injected decision.
     verdict_node produces final verdict and summary.
-    GitHub comment posted if approved.
-
-Error Routing
--------------
-check_error() routes to hitl_node immediately on upstream failure.
-This ensures a human always inspects the result even on partial failure.
-The error flag and reason are displayed in verdict_node output.
-
-Routing Controllers
--------------------
-check_error()          — after analyze: error → hitl, ok → lint (or reflect)
-should_reflect()       — after reflect: loop until REFLECTION_PASSES reached
-should_lint_refactor() — after lint: passed → hitl, failed → refactor
-should_refactor()      — after validator: passed → hitl, failed → loop (max 2)
 
 Singleton Pattern
 -----------------
-get_review_graph() returns the cached compiled graph instance.
-review_graph module-level alias is required for review_service.py import.
-MemorySaver is used for local dev — swap for AsyncPostgresSaver in P6.
+get_review_graph() returns the cached compiled graph.
+review_graph module-level alias required for review_service.py import.
+MemorySaver used for local dev — swap for AsyncPostgresSaver in P6.
 """
 
 from langgraph.graph import StateGraph, END
@@ -73,11 +97,14 @@ from langgraph.types import interrupt
 from app.graph.state import ReviewState
 from app.graph.nodes import (
     fetch_diff_node,
+    retrieve_context_node,
+    grade_context_node,
     analyze_code_node,
     reflect_node,
     lint_node,
     refactor_node,
     validator_node,
+    memory_write_node,
     verdict_node,
 )
 from app.core.logger import get_logger
@@ -89,18 +116,58 @@ logger = get_logger(__name__)
 
 # Number of self-reflection passes after analyze_code_node.
 #
-# DEVELOPMENT : 0  — skip reflection entirely (1 LLM call per review)
-# STAGING     : 1  — one reflection pass      (2 LLM calls per review)
-# PRODUCTION  : 2  — full reflection loop     (3 LLM calls per review)
+# DEVELOPMENT : 0  — skip reflection entirely (1-2 LLM calls per review)
+# STAGING     : 1  — one reflection pass      (2-3 LLM calls per review)
+# PRODUCTION  : 2  — full reflection loop     (3-4 LLM calls per review)
 #
-# Each pass sends one Gemini request. Free tier = 20 RPD on gemini-2.5-flash-lite.
-# At REFLECTION_PASSES=0: 20 full reviews per day.
-# At REFLECTION_PASSES=1: 10 full reviews per day.
-# At REFLECTION_PASSES=2:  6 full reviews per day.
+# Free tier = 20 RPD on gemini-2.5-flash-lite.
+# At REFLECTION_PASSES=0 with RAG active: ~10 reviews/day.
+# At REFLECTION_PASSES=0 without RAG:    ~20 reviews/day.
 REFLECTION_PASSES: int = 0
 
 
 # ── Routing Controllers ───────────────────────────────────────────────────────
+
+def check_rag_error(state: ReviewState) -> str:
+    """
+    Route after grade_context_node (P4).
+
+    If an upstream error was set by fetch_diff_node or retrieve_context_node,
+    skip analyze_code_node and route directly to hitl_node.
+
+    On success, always routes to analyze_code_node regardless of whether
+    context was retrieved — analyze_code_node handles empty repo_context
+    gracefully by omitting the context section from its prompt.
+
+    Parameters
+    ----------
+    state : ReviewState
+
+    Returns
+    -------
+    str
+        "hitl_node"        — upstream error detected
+        "analyze_code_node" — normal path (with or without context)
+    """
+    if state.get("error"):
+        logger.error(
+            "[workflow] check_rag_error: upstream error detected — "
+            "reason=%s, routing to hitl_node",
+            state.get("error_reason", "unknown"),
+        )
+        return "hitl_node"
+
+    context_grade = state.get("context_grade", "skipped")
+    repo_context = state.get("repo_context", "")
+
+    logger.info(
+        "[workflow] check_rag_error: no error — "
+        "context_grade=%s repo_context_chars=%d, routing to analyze_code_node",
+        context_grade,
+        len(repo_context),
+    )
+    return "analyze_code_node"
+
 
 def check_error(state: ReviewState) -> str:
     """
@@ -120,14 +187,14 @@ def check_error(state: ReviewState) -> str:
     Returns
     -------
     str
-        "hitl_node"    — upstream error detected
-        "reflect_node" — REFLECTION_PASSES > 0 and no error
-        "lint_node"    — REFLECTION_PASSES == 0 and no error
+        "hitl_node"     — upstream error detected
+        "reflect_node"  — REFLECTION_PASSES > 0 and no error
+        "lint_node"     — REFLECTION_PASSES == 0 and no error
     """
     if state.get("error"):
         logger.error(
             "[workflow] check_error: upstream error detected — "
-            "reason=%s, skipping reflection+lint, routing to hitl_node",
+            "reason=%s, routing to hitl_node",
             state.get("error_reason", "unknown"),
         )
         return "hitl_node"
@@ -154,7 +221,7 @@ def should_reflect(state: ReviewState) -> str:
     Loops until reflection_count reaches REFLECTION_PASSES, then routes
     to lint_node. Each pass sends one LLM request to Gemini.
 
-    Only called when REFLECTION_PASSES > 0. When REFLECTION_PASSES == 0,
+    Only reachable when REFLECTION_PASSES > 0. When REFLECTION_PASSES == 0,
     check_error() routes directly to lint_node and this function is never
     invoked.
 
@@ -192,7 +259,7 @@ def should_lint_refactor(state: ReviewState) -> str:
     Route after lint_node.
 
     If lint passed or was skipped (no Python files, no sandbox), proceed
-    directly to hitl_node — no refactor needed.
+    to memory_write_node (P4) before the HITL gate.
 
     If lint failed, route to refactor_node to generate a corrective patch.
 
@@ -203,22 +270,22 @@ def should_lint_refactor(state: ReviewState) -> str:
     Returns
     -------
     str
-        "hitl_node"     — lint passed or skipped, or upstream error
-        "refactor_node" — lint failed, refactor attempt needed
+        "memory_write_node" — lint passed or skipped, or upstream error
+        "refactor_node"     — lint failed, refactor attempt needed
     """
     if state.get("error"):
         logger.error(
             "[workflow] should_lint_refactor: error in state — "
-            "routing to hitl_node"
+            "routing to memory_write_node then hitl"
         )
-        return "hitl_node"
+        return "memory_write_node"
 
     if state.get("lint_passed", True):
         logger.info(
             "[workflow] should_lint_refactor: lint passed — "
-            "routing to hitl_node"
+            "routing to memory_write_node"
         )
-        return "hitl_node"
+        return "memory_write_node"
 
     logger.warning(
         "[workflow] should_lint_refactor: lint FAILED — "
@@ -232,8 +299,7 @@ def should_refactor(state: ReviewState) -> str:
     Control the refactor/validation loop after validator_node.
 
     Loops until validation passes or refactor_count reaches 2.
-    After max attempts, routes to hitl_node regardless — human
-    reviews the partial output.
+    After max attempts, routes to memory_write_node (P4) before hitl_node.
 
     Parameters
     ----------
@@ -242,15 +308,15 @@ def should_refactor(state: ReviewState) -> str:
     Returns
     -------
     str
-        "hitl_node"     — validation passed, max attempts reached, or error
-        "refactor_node" — validation failed and attempts remaining
+        "memory_write_node" — validation passed, max attempts reached, or error
+        "refactor_node"     — validation failed and attempts remaining
     """
     if state.get("error"):
         logger.error(
             "[workflow] should_refactor: error in state — "
-            "routing to hitl_node"
+            "routing to memory_write_node"
         )
-        return "hitl_node"
+        return "memory_write_node"
 
     count = state.get("refactor_count", 0)
     passed = state.get("validation_passed", False)
@@ -258,9 +324,9 @@ def should_refactor(state: ReviewState) -> str:
     if passed:
         logger.info(
             "[workflow] should_refactor: validation passed — "
-            "routing to hitl_node"
+            "routing to memory_write_node"
         )
-        return "hitl_node"
+        return "memory_write_node"
 
     if count < 2:
         logger.warning(
@@ -272,10 +338,10 @@ def should_refactor(state: ReviewState) -> str:
 
     logger.warning(
         "[workflow] should_refactor: max refactor attempts reached (%d/2) — "
-        "routing to hitl_node regardless of validation result",
+        "routing to memory_write_node",
         count,
     )
-    return "hitl_node"
+    return "memory_write_node"
 
 
 # ── HITL Node ─────────────────────────────────────────────────────────────────
@@ -290,19 +356,17 @@ def hitl_node(state: ReviewState) -> dict:
     snapshot.next being non-empty — no Python exception is raised.
 
     This node only executes on resume via Command(resume=decision).
-    At that point, interrupt() returns the decision string injected by
-    review_service.decide_review() and the node writes it to state.
+    interrupt() returns the decision string injected by decide_review()
+    and the node writes it to state for verdict_node to read.
 
     Guard Clause
     ------------
-    If human_decision is already set (duplicate resume attempt), the node
-    returns {} immediately without calling interrupt() again. This prevents
-    double-interrupt crashes on retry scenarios.
+    If human_decision is already set (duplicate resume attempt), returns {}
+    immediately to prevent double-interrupt crashes.
 
     Parameters
     ----------
     state : ReviewState
-        Graph state at resume time. Contains all accumulated node outputs.
 
     Returns
     -------
@@ -318,11 +382,10 @@ def hitl_node(state: ReviewState) -> dict:
         pr_number,
     )
 
-    # Guard — already decided on a previous resume attempt
     if state.get("human_decision") is not None:
         logger.info(
             "[hitl_node] human_decision already set to '%s' — "
-            "skipping interrupt(), returning empty dict to avoid double-resume",
+            "returning empty dict to prevent double-resume",
             state["human_decision"],
         )
         return {}
@@ -348,73 +411,93 @@ def hitl_node(state: ReviewState) -> dict:
 
 def build_graph():
     """
-    Construct and compile the P3 LangGraph StateGraph.
+    Construct and compile the P4 LangGraph StateGraph.
 
-    Node Registration
-    -----------------
-    All eight nodes are registered. reflect_node is registered even when
-    REFLECTION_PASSES=0 because LangGraph requires all declared nodes to
-    exist. check_error() simply never routes to it when passes=0.
+    Node Registration (P4 — 11 nodes total)
+    ----------------------------------------
+    fetch_diff_node       — GitHub API: metadata, files, diff
+    retrieve_context_node — ChromaDB query for repo context (P4)
+    grade_context_node    — CRAG relevance grader (P4)
+    analyze_code_node     — Gemini analysis (context-aware in P4)
+    reflect_node          — self-reflection loop (REFLECTION_PASSES=0 in dev)
+    lint_node             — ruff in Docker sandbox
+    refactor_node         — Gemini corrective patch
+    validator_node        — ruff + pytest in Docker
+    memory_write_node     — write findings to ChromaDB (P4)
+    hitl_node             — human decision gate
+    verdict_node          — final verdict + GitHub comment markdown
 
-    Conditional Edges
-    -----------------
-    check_error()     after analyze_code_node — routes to lint or reflect or hitl
-    should_reflect()  after reflect_node      — loops or proceeds to lint
-    should_lint_refactor() after lint_node    — routes to refactor or hitl
-    should_refactor() after validator_node    — loops or proceeds to hitl
+    Edge Flow
+    ---------
+    fetch_diff_node
+        → retrieve_context_node (always)
+        → grade_context_node (always)
+        → check_rag_error() → analyze_code_node | hitl_node
+        → check_error() → reflect_node | lint_node | hitl_node
+        → should_reflect() → reflect_node | lint_node
+        → should_lint_refactor() → memory_write_node | refactor_node
+        → refactor_node → validator_node
+        → should_refactor() → memory_write_node | refactor_node
+        → memory_write_node → hitl_node (always)
+        → hitl_node → verdict_node (always)
+        → verdict_node → END
 
     Compilation Options
     -------------------
     checkpointer=MemorySaver()
-        REQUIRED for interrupt_before to work. Graph state is persisted
-        so it can be resumed after the HITL pause. MemorySaver is in-process
-        (lost on restart). Swap for AsyncPostgresSaver in P6 for persistence.
+        Required for interrupt_before. State persisted in-process.
+        Swap for AsyncPostgresSaver in P6 for cross-restart persistence.
 
     interrupt_before=["hitl_node"]
-        CRITICAL. Without this, interrupt() inside hitl_node has no effect
-        and the graph runs straight through to verdict_node without pausing.
-        This causes astream() to stop yielding before hitl_node executes.
+        Critical for HITL. Without this, astream() completes without pausing.
         Detected by review_service via snapshot.next == ["hitl_node"].
 
     Returns
     -------
     CompiledStateGraph
-        Ready for graph.astream() and graph.ainvoke(Command(resume=...)).
-
-    Raises
-    ------
-    Exception
-        Re-raised on compilation failure — server startup should fail loudly
-        rather than silently serving a broken graph.
     """
     try:
         logger.info(
-            "[workflow] Building LangGraph workflow — "
+            "[workflow] Building LangGraph P4 workflow — "
             "REFLECTION_PASSES=%d",
             REFLECTION_PASSES,
         )
 
         builder = StateGraph(ReviewState)
 
-        # ── Register nodes ────────────────────────────────────────────────────
-        builder.add_node("fetch_diff_node",   fetch_diff_node)
-        builder.add_node("analyze_code_node", analyze_code_node)
-        builder.add_node("reflect_node",      reflect_node)    # registered but
-        builder.add_node("lint_node",         lint_node)       # may be skipped
-        builder.add_node("refactor_node",     refactor_node)   # when PASSES=0
-        builder.add_node("validator_node",    validator_node)
-        builder.add_node("hitl_node",         hitl_node)
-        builder.add_node("verdict_node",      verdict_node)
+        # ── Register all nodes ────────────────────────────────────────────────
+        builder.add_node("fetch_diff_node",        fetch_diff_node)
+        builder.add_node("retrieve_context_node",  retrieve_context_node)   # P4
+        builder.add_node("grade_context_node",     grade_context_node)      # P4
+        builder.add_node("analyze_code_node",      analyze_code_node)
+        builder.add_node("reflect_node",           reflect_node)
+        builder.add_node("lint_node",              lint_node)
+        builder.add_node("refactor_node",          refactor_node)
+        builder.add_node("validator_node",         validator_node)
+        builder.add_node("memory_write_node",      memory_write_node)       # P4
+        builder.add_node("hitl_node",              hitl_node)
+        builder.add_node("verdict_node",           verdict_node)
 
         # ── Entry point ───────────────────────────────────────────────────────
         builder.set_entry_point("fetch_diff_node")
 
-        # ── Core flow ─────────────────────────────────────────────────────────
+        # ── Step 1: fetch → retrieve context ─────────────────────────────────
+        builder.add_edge("fetch_diff_node", "retrieve_context_node")
 
-        # Step 1: fetch → analyze
-        builder.add_edge("fetch_diff_node", "analyze_code_node")
+        # ── Step 2: retrieve → grade context ─────────────────────────────────
+        builder.add_edge("retrieve_context_node", "grade_context_node")
 
-        # Step 2: analyze → (error→hitl | PASSES=0→lint | PASSES>0→reflect)
+        # ── Step 3: grade → (error→hitl | ok→analyze) ────────────────────────
+        builder.add_conditional_edges(
+            "grade_context_node",
+            check_rag_error,
+            {
+                "hitl_node":        "hitl_node",
+                "analyze_code_node": "analyze_code_node",
+            },
+        )
+
+        # ── Step 4: analyze → (error→hitl | PASSES=0→lint | PASSES>0→reflect) ─
         builder.add_conditional_edges(
             "analyze_code_node",
             check_error,
@@ -425,7 +508,7 @@ def build_graph():
             },
         )
 
-        # Step 3: reflect → (loop | lint)  — only reached when PASSES > 0
+        # ── Step 5: reflect → (loop | lint) ──────────────────────────────────
         builder.add_conditional_edges(
             "reflect_node",
             should_reflect,
@@ -435,34 +518,37 @@ def build_graph():
             },
         )
 
-        # Step 4: lint → (hitl | refactor)
+        # ── Step 6: lint → (memory_write | refactor) ─────────────────────────
         builder.add_conditional_edges(
             "lint_node",
             should_lint_refactor,
             {
-                "hitl_node":     "hitl_node",
-                "refactor_node": "refactor_node",
+                "memory_write_node": "memory_write_node",
+                "refactor_node":     "refactor_node",
             },
         )
 
-        # Step 5: refactor → validate
+        # ── Step 7: refactor → validate ───────────────────────────────────────
         builder.add_edge("refactor_node", "validator_node")
 
-        # Step 6: validate → (loop | hitl)
+        # ── Step 8: validate → (loop | memory_write) ─────────────────────────
         builder.add_conditional_edges(
             "validator_node",
             should_refactor,
             {
-                "refactor_node": "refactor_node",
-                "hitl_node":     "hitl_node",
+                "memory_write_node": "memory_write_node",
+                "refactor_node":     "refactor_node",
             },
         )
 
-        # Step 7: hitl → verdict → END
+        # ── Step 9: memory_write → hitl (always) ─────────────────────────────
+        builder.add_edge("memory_write_node", "hitl_node")
+
+        # ── Step 10: hitl → verdict → END ─────────────────────────────────────
         builder.add_edge("hitl_node",    "verdict_node")
         builder.add_edge("verdict_node", END)
 
-        # ── Compile with HITL interrupt ───────────────────────────────────────
+        # ── Compile ───────────────────────────────────────────────────────────
         memory = MemorySaver()
 
         graph = builder.compile(
@@ -471,8 +557,9 @@ def build_graph():
         )
 
         logger.info(
-            "[workflow] LangGraph workflow compiled successfully — "
-            "interrupt_before=['hitl_node'] REFLECTION_PASSES=%d",
+            "[workflow] P4 LangGraph workflow compiled — "
+            "nodes=11 interrupt_before=['hitl_node'] "
+            "REFLECTION_PASSES=%d",
             REFLECTION_PASSES,
         )
         return graph
@@ -491,23 +578,19 @@ def get_review_graph():
     """
     Lazily initialize and return the singleton compiled graph.
 
-    The graph is built once on the first call and cached. Subsequent calls
-    return the cached instance. This avoids repeated StateGraph compilation
-    and MemorySaver instantiation on every request.
-
-    The singleton also ensures the MemorySaver checkpointer is shared across
-    all requests — critical for HITL resume to work, since the checkpoint
-    written during trigger_review() must be readable by decide_review().
+    Built once on first call, cached for all subsequent requests.
+    The MemorySaver singleton is critical — the checkpoint written by
+    trigger_review() must be readable by decide_review() using the
+    same MemorySaver instance.
 
     Returns
     -------
     CompiledStateGraph
-        The singleton compiled graph instance.
     """
     global _review_graph
 
     if _review_graph is None:
-        logger.info("[workflow] Initializing graph lazily")
+        logger.info("[workflow] Initializing P4 graph lazily")
         _review_graph = build_graph()
 
     return _review_graph
@@ -515,5 +598,4 @@ def get_review_graph():
 
 # Module-level alias — required for:
 #   from app.graph.workflow import review_graph
-# Used by review_service.py trigger_review() and decide_review().
 review_graph = get_review_graph()

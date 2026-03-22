@@ -1,18 +1,21 @@
 """
 app/graph/nodes.py
 
-LangGraph Agent Nodes — P3 Production Version
+LangGraph Agent Nodes — P4 Production Version
 ----------------------------------------------
 Each function is one node in the review workflow graph.
 
 Node execution order (defined in workflow.py):
     fetch_diff_node
-        → analyze_code_node
-        → reflect_node (×2 via should_reflect)
-        → lint_node
-        → refactor_node (conditional)
-        → validator_node (conditional)
-        → hitl_node     [interrupt_before pauses here]
+        → retrieve_context_node  ★ P4 — query ChromaDB for repo context
+        → grade_context_node     ★ P4 — grade relevance of retrieved context
+        → analyze_code_node          — Gemini analysis with graded context
+        → reflect_node               — self-reflection (REFLECTION_PASSES=0 dev)
+        → lint_node                  — ruff in Docker sandbox
+        → refactor_node              — Gemini corrective patch (conditional)
+        → validator_node             — ruff + pytest in Docker (conditional)
+        → memory_write_node      ★ P4 — write findings to ChromaDB memory
+        → hitl_node              [interrupt_before pauses here]
         → verdict_node
         → END
 
@@ -23,7 +26,8 @@ Design Principles
 3. LLM failures are SOFT — graph never crashes on quota errors.
 4. Quota detection is INSTANT — max_retries=0 prevents retry storms.
 5. Every node logs entry, exit, and any failure with structured context.
-6. sandbox_client and llm are module-level globals for patch.object in tests.
+6. sandbox_client and _llm_instance are module-level for patch.object in tests.
+7. ChromaDB is OPTIONAL — all nodes skip gracefully if collection unavailable.
 
 LLM Failure Signals
 -------------------
@@ -36,11 +40,27 @@ When these signals are returned by safe_llm_invoke():
     - The HITL gate still fires — human can review degraded output
     - verdict_node produces a clear summary of what happened
 
+ChromaDB / RAG (P4)
+-------------------
+retrieve_context_node queries ChromaDB with the PR diff as the search query.
+grade_context_node asks Gemini to grade whether the retrieved context is
+relevant to the current PR. If grade is "yes", context is passed to
+analyze_code_node. If "no", an empty context is used instead (CRAG pattern).
+memory_write_node writes the review findings (issues + verdict) to ChromaDB
+after the review completes so future reviews on the same repo are context-aware.
+
+Embedding Model
+---------------
+gemini-embedding-001 is used for ChromaDB embeddings.
+This model is confirmed available on the project API key.
+ChromaDB collection is initialized lazily — returns None on any failure.
+All nodes that use ChromaDB check for None before calling.
+
 Async Safety
 ------------
-LLM_SEMAPHORE limits concurrent Gemini calls to 2.
+LLM_SEMAPHORE limits concurrent Gemini calls to 1 (free tier safe).
 LLM_TIMEOUT enforces a hard 30-second ceiling per call.
-Both prevent runaway resource consumption on the free tier.
+A 2-second cooldown after each successful call prevents RPM burst.
 
 Patching in Tests
 -----------------
@@ -52,15 +72,21 @@ Patching in Tests
 
     with patch.object(nodes, "_llm_instance", mock_llm):
         ...
+
+    with patch.object(nodes, "_chroma_collection", mock_collection):
+        ...
 """
 
 import os
 import sys
+import time
+import uuid
 import asyncio
-from typing import List, Any, Dict, Optional
+from collections import deque
+from typing import List, Any, Dict, Optional, Tuple
 
 from langsmith import traceable
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from app.graph.state import ReviewState
@@ -70,66 +96,318 @@ from app.core.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Add at top of file
-import time
-import uuid
-from collections import deque
 
-# ── Burst Tracking ───────────────────────────────────────────────────────────
+# ── Constants ─────────────────────────────────────────────────────────────────
 
-LLM_CALL_HISTORY = deque(maxlen=100)
-"""Stores timestamps of recent LLM calls for burst detection."""
+LLM_TIMEOUT: int = 30
+"""Hard ceiling (seconds) for a single Gemini API call."""
+
+LLM_SEMAPHORE: asyncio.Semaphore = asyncio.Semaphore(1)
+"""
+Limits concurrent LLM calls to 1 on the free tier.
+Prevents RPM burst errors when multiple requests arrive simultaneously.
+Increase to 2 when billing is enabled.
+"""
+
+MAX_DIFF_CHARS: int = 4000
+"""Maximum diff characters sent to Gemini — keeps prompt within token limits."""
+
+MAX_CONTEXT_CHARS: int = 2000
+"""Maximum repo context characters injected into the analysis prompt."""
+
+FREE_TIER_EXHAUSTED: str = "FREE_TIER_EXHAUSTED"
+"""Sentinel returned by safe_llm_invoke() on 429 quota error."""
+
+LLM_ERROR: str = "LLM_ERROR"
+"""Sentinel returned by safe_llm_invoke() on timeout or unexpected failure."""
+
+CONTEXT_GRADE_YES: str = "yes"
+"""Grade returned by grade_context_node when retrieved context is relevant."""
+
+CONTEXT_GRADE_NO: str = "no"
+"""Grade returned by grade_context_node when retrieved context is not relevant."""
 
 
-def _record_llm_call():
+# ── Module-level lazy singletons (patchable in tests) ────────────────────────
+
+_llm_instance: Optional[ChatGoogleGenerativeAI] = None
+"""
+Lazily initialized Gemini chat model instance.
+Access via get_llm() — never reference this directly outside get_llm().
+Module-level so patch.object(nodes, '_llm_instance', mock) works in tests.
+"""
+
+sandbox_client = None
+"""
+Lazily initialized SandboxClient.
+Module-level so patch.object(nodes, 'sandbox_client', mock_sc) works in tests.
+"""
+
+_chroma_collection = None
+"""
+Lazily initialized ChromaDB collection.
+Module-level so patch.object(nodes, '_chroma_collection', mock) works in tests.
+Set to None if ChromaDB init fails — all RAG nodes check for None gracefully.
+"""
+
+_chroma_embedder: Optional[GoogleGenerativeAIEmbeddings] = None
+"""
+Lazily initialized Gemini embedding model for ChromaDB queries.
+Uses gemini-embedding-001 — confirmed available on the project API key.
+"""
+
+
+# ── Burst Tracking ────────────────────────────────────────────────────────────
+
+_LLM_CALL_HISTORY: deque = deque(maxlen=100)
+"""Sliding window of LLM call timestamps for burst detection logging."""
+
+
+def _record_llm_call() -> int:
+    """
+    Record an LLM call timestamp and return the burst count in the last 10s.
+
+    Used only for observability logging — does not throttle calls.
+    The semaphore handles actual concurrency limiting.
+
+    Returns
+    -------
+    int
+        Number of LLM calls recorded in the last 10 seconds.
+    """
     now = time.time()
-    LLM_CALL_HISTORY.append(now)
-
-    # Count calls in last 10 seconds
-    window = 10
-    count = sum(1 for t in LLM_CALL_HISTORY if now - t <= window)
-
-    return count
+    _LLM_CALL_HISTORY.append(now)
+    window_seconds = 10
+    return sum(1 for t in _LLM_CALL_HISTORY if now - t <= window_seconds)
 
 
-# ── Safe LLM Invocation (Instrumented) ───────────────────────────────────────
+# ── LLM Initialization ────────────────────────────────────────────────────────
+
+def get_llm() -> ChatGoogleGenerativeAI:
+    """
+    Return the module-level Gemini chat model, initializing on first call.
+
+    Configuration
+    -------------
+    model        : gemini-2.5-flash-lite — confirmed working on project API key
+    temperature  : 0                     — deterministic output for code review
+    max_retries  : 0                     — CRITICAL: prevents internal SDK retry
+                                           storms that silently exhaust free quota.
+                                           safe_llm_invoke() handles retry logic.
+
+    The module-level singleton pattern ensures the model is only initialized
+    once per process lifetime, avoiding repeated API key validation overhead.
+
+    Returns
+    -------
+    ChatGoogleGenerativeAI
+        Initialized Gemini chat model instance.
+
+    Raises
+    ------
+    CustomException
+        If GOOGLE_API_KEY is not set in environment.
+    """
+    global _llm_instance
+
+    if _llm_instance is not None:
+        return _llm_instance
+
+    api_key = os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        logger.error(
+            "[nodes] get_llm: GOOGLE_API_KEY not found in environment — "
+            "check that app/core/config.py loaded .env correctly"
+        )
+        raise CustomException("GOOGLE_API_KEY is not set in environment", sys)
+
+    logger.info(
+        "[nodes] get_llm: Initializing Gemini LLM — "
+        "model=gemini-2.5-flash-lite max_retries=0 temperature=0"
+    )
+
+    _llm_instance = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash-lite",
+        temperature=0,
+        max_retries=0,
+    )
+
+    logger.info("[nodes] Primary LLM initialized successfully")
+    return _llm_instance
+
+
+# ── Sandbox Initialization ────────────────────────────────────────────────────
+
+def get_sandbox():
+    """
+    Return the module-level SandboxClient, initializing on first call.
+
+    Safe to call when Docker Desktop is not running — SandboxClient.__init__
+    does not connect to Docker. Connection only happens inside run_lint()
+    and run_tests() when they are actually invoked.
+
+    Returns
+    -------
+    SandboxClient or None
+        None if Docker SDK is not available or initialization fails.
+        Callers must check for None before using.
+    """
+    global sandbox_client
+
+    if sandbox_client is not None:
+        return sandbox_client
+
+    try:
+        from app.mcp.sandbox_client import SandboxClient
+        sandbox_client = SandboxClient()
+        logger.info("[nodes] get_sandbox: SandboxClient initialized successfully")
+    except Exception:
+        logger.exception(
+            "[nodes] get_sandbox: SandboxClient initialization failed — "
+            "lint_node and validator_node will be skipped"
+        )
+        sandbox_client = None
+
+    return sandbox_client
+
+
+# ── ChromaDB Initialization ───────────────────────────────────────────────────
+
+def get_chroma_collection() -> Tuple[Optional[Any], Optional[GoogleGenerativeAIEmbeddings]]:
+    """
+    Return the module-level ChromaDB collection and embedder, initializing lazily.
+
+    Embedding Model
+    ---------------
+    Uses gemini-embedding-001 — confirmed available on the project API key.
+    Do NOT use text-embedding-004 (not available on this key).
+    Do NOT use gemini-embedding-2-preview (preview, unstable for production).
+
+    ChromaDB Path
+    -------------
+    Persistent client at ./chroma_store — created on first call.
+    Collection name: "repo_context"
+    This collection is empty until the P4 indexing pipeline populates it.
+
+    Returns
+    -------
+    Tuple[Optional[collection], Optional[embedder]]
+        (collection, embedder) on success.
+        (None, None) on any failure — all callers handle this gracefully.
+
+    Notes
+    -----
+    Module-level so patch.object(nodes, '_chroma_collection', mock) works in tests.
+    """
+    global _chroma_collection, _chroma_embedder
+
+    if _chroma_collection is not None:
+        return _chroma_collection, _chroma_embedder
+
+    try:
+        import chromadb
+        from langchain_google_genai import GoogleGenerativeAIEmbeddings
+
+        api_key = os.environ.get("GOOGLE_API_KEY")
+        if not api_key:
+            logger.warning(
+                "[nodes] get_chroma_collection: GOOGLE_API_KEY not set — "
+                "ChromaDB disabled"
+            )
+            return None, None
+
+        logger.info(
+            "[nodes] get_chroma_collection: Initializing ChromaDB — "
+            "model=gemini-embedding-001 path=./chroma_store"
+        )
+
+        _chroma_embedder = GoogleGenerativeAIEmbeddings(
+            model="gemini-embedding-001",
+            google_api_key=api_key,
+            task_type="RETRIEVAL_DOCUMENT",
+        )
+
+        client = chromadb.PersistentClient(path="./chroma_store")
+
+        _chroma_collection = client.get_or_create_collection(
+            name="repo_context",
+            metadata={"hnsw:space": "cosine"},
+        )
+
+        logger.info(
+            "[nodes] get_chroma_collection: ChromaDB ready — "
+            "collection=repo_context count=%d",
+            _chroma_collection.count(),
+        )
+
+        return _chroma_collection, _chroma_embedder
+
+    except Exception as e:
+        logger.warning(
+            "[nodes] get_chroma_collection: ChromaDB init failed — "
+            "RAG nodes will be skipped. error=%s",
+            str(e),
+        )
+        return None, None
+
+
+# ── Safe LLM Invocation ───────────────────────────────────────────────────────
 
 async def safe_llm_invoke(messages: List[Any]) -> str:
+    """
+    Invoke Gemini with quota protection, timeout, and burst prevention.
+
+    This is the SINGLE call site for all LLM invocations in the graph.
+    It guarantees:
+        - Graph never crashes on LLM failure
+        - Free-tier quota errors are detected instantly (no retry storm)
+        - Hard 30s timeout prevents runaway async tasks
+        - Concurrent calls bounded by LLM_SEMAPHORE (1 on free tier)
+        - 2-second cooldown after success prevents RPM burst
+
+    Parameters
+    ----------
+    messages : List[Any]
+        LangChain message list (SystemMessage + HumanMessage).
+
+    Returns
+    -------
+    str
+        One of:
+        - Normal LLM response content string
+        - FREE_TIER_EXHAUSTED  (on 429 quota error — after 60s wait)
+        - LLM_ERROR            (on timeout or unexpected failure)
+    """
     call_id = str(uuid.uuid4())[:8]
     start_time = time.time()
 
     logger.info(
         "[LLM][%s] REQUEST_START | queued_for_semaphore | msg_count=%d",
-        call_id,
-        len(messages),
+        call_id, len(messages),
     )
 
-    # Track queue wait time
     queue_start = time.time()
 
     async with LLM_SEMAPHORE:
         queue_wait = time.time() - queue_start
-
-        # Burst tracking
         burst_count = _record_llm_call()
 
         logger.info(
-            "[LLM][%s] ACQUIRED | queue_wait=%.2fs | concurrent_limit=%d | burst_last_10s=%d",
+            "[LLM][%s] ACQUIRED | queue_wait=%.2fs | "
+            "concurrent_limit=%d | burst_last_10s=%d",
             call_id,
             queue_wait,
-            LLM_SEMAPHORE._value,  # remaining slots
+            LLM_SEMAPHORE._value,
             burst_count,
         )
 
         try:
             llm = get_llm()
-
             invoke_start = time.time()
 
             logger.info(
                 "[LLM][%s] INVOKE_START | timeout=%ds",
-                call_id,
-                LLM_TIMEOUT,
+                call_id, LLM_TIMEOUT,
             )
 
             response = await asyncio.wait_for(
@@ -142,30 +420,25 @@ async def safe_llm_invoke(messages: List[Any]) -> str:
 
             logger.info(
                 "[LLM][%s] SUCCESS | invoke_time=%.2fs | total_time=%.2fs",
-                call_id,
-                invoke_time,
-                total_time,
+                call_id, invoke_time, total_time,
             )
 
-            # ── Cooldown to prevent burst ─────────────────────────────
-            cooldown = 2
+            # Cooldown prevents back-to-back RPM burst
+            cooldown_seconds = 2
             logger.info(
                 "[LLM][%s] COOLDOWN | sleeping=%ds to prevent RPM burst",
-                call_id,
-                cooldown,
+                call_id, cooldown_seconds,
             )
-            await asyncio.sleep(cooldown)
+            await asyncio.sleep(cooldown_seconds)
 
             return response.content
 
         except asyncio.TimeoutError:
             total_time = time.time() - start_time
-
             logger.error(
-                "[LLM][%s] TIMEOUT | exceeded=%ds | total_time=%.2fs",
-                call_id,
-                LLM_TIMEOUT,
-                total_time,
+                "[LLM][%s] TIMEOUT | exceeded=%ds | total_time=%.2fs — "
+                "returning LLM_ERROR",
+                call_id, LLM_TIMEOUT, total_time,
             )
             return LLM_ERROR
 
@@ -177,148 +450,29 @@ async def safe_llm_invoke(messages: List[Any]) -> str:
                 logger.error(
                     "[LLM][%s] RATE_LIMIT | 429 hit | total_time=%.2fs | "
                     "sleeping=60s before returning FREE_TIER_EXHAUSTED",
-                    call_id,
-                    total_time,
+                    call_id, total_time,
                 )
-
                 await asyncio.sleep(60)
-
                 return FREE_TIER_EXHAUSTED
 
             logger.exception(
-                "[LLM][%s] FAILURE | total_time=%.2fs | error=%s",
-                call_id,
-                total_time,
-                error_str,
+                "[LLM][%s] FAILURE | total_time=%.2fs | error=%s — "
+                "returning LLM_ERROR",
+                call_id, total_time, error_str,
             )
             return LLM_ERROR
 
         finally:
             logger.info("[LLM][%s] REQUEST_END", call_id)
-# ── Constants ─────────────────────────────────────────────────────────────────
-
-LLM_TIMEOUT: int = 30
-"""Hard ceiling (seconds) for a single Gemini API call."""
-
-LLM_SEMAPHORE: asyncio.Semaphore = asyncio.Semaphore(2)
-"""Limits concurrent LLM calls to 2 — prevents free-tier saturation."""
-
-MAX_DIFF_CHARS: int = 4000
-"""Maximum diff characters sent to Gemini — keeps prompt within token limits."""
-
-FREE_TIER_EXHAUSTED: str = "FREE_TIER_EXHAUSTED"
-"""Sentinel returned by safe_llm_invoke() on 429 quota error."""
-
-LLM_ERROR: str = "LLM_ERROR"
-"""Sentinel returned by safe_llm_invoke() on any other LLM failure."""
-
-
-# ── Module-level lazy singletons (patchable in tests) ────────────────────────
-
-_llm_instance: Optional[ChatGoogleGenerativeAI] = None
-"""
-Lazily initialized Gemini LLM instance.
-Access via get_llm() — never reference directly.
-Module-level so patch.object(nodes, '_llm_instance', mock) works in tests.
-"""
-
-sandbox_client = None
-"""
-Lazily initialized SandboxClient.
-Module-level so patch.object(nodes, 'sandbox_client', mock_sc) works in tests.
-"""
-
-
-# ── LLM Initialization ────────────────────────────────────────────────────────
-
-def get_llm() -> ChatGoogleGenerativeAI:
-    """
-    Return the module-level Gemini LLM instance, initializing it on first call.
-
-    Configuration
-    -------------
-    model        : gemini-2.0-flash  (lower quota usage than 2.5-flash)
-    temperature  : 0                 (deterministic output for code review)
-    max_retries  : 0                 (CRITICAL — prevents internal retry storms
-                                      that exhaust free-tier quota silently)
-
-    Raises
-    ------
-    CustomException
-        If GOOGLE_API_KEY is not set in environment.
-
-    Returns
-    -------
-    ChatGoogleGenerativeAI
-        Initialized Gemini chat model instance.
-    """
-    global _llm_instance
-
-    if _llm_instance is not None:
-        return _llm_instance
-
-    api_key = os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
-        logger.error(
-            "[nodes] GOOGLE_API_KEY not found in environment — "
-            "check config.py loaded correctly"
-        )
-        raise CustomException("GOOGLE_API_KEY is not set in environment", sys)
-
-    logger.info(
-    "[nodes] Initializing Gemini LLM — "
-    "model=gemini-2.5-flash-lite max_retries=0 temperature=0"
-)
-    
-    _llm_instance = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash-lite",
-        temperature=0,
-        max_retries=0,
-    )
-
-    logger.info("[nodes] Primary LLM initialized")
-    return _llm_instance
-
-# ── Sandbox Initialization ────────────────────────────────────────────────────
-
-def get_sandbox():
-    """
-    Return the module-level SandboxClient instance, initializing it on first call.
-
-    Safe to call even when Docker Desktop is not running — SandboxClient.__init__
-    does not connect to Docker. Connection only happens inside run_lint() / run_tests().
-
-    Returns
-    -------
-    SandboxClient or None
-        None if initialization fails (Docker SDK not available).
-    """
-    global sandbox_client
-
-    if sandbox_client is not None:
-        return sandbox_client
-
-    try:
-        from app.mcp.sandbox_client import SandboxClient
-        sandbox_client = SandboxClient()
-        logger.info("[nodes] Sandbox initialized")
-    except Exception:
-        logger.exception(
-            "[nodes] SandboxClient initialization failed — "
-            "sandbox steps will be skipped"
-        )
-        sandbox_client = None
-
-    return sandbox_client
 
 
 # ── Output Parser ─────────────────────────────────────────────────────────────
 
-def _parse_llm_output(raw: str) -> tuple[list[str], list[str]]:
+def _parse_llm_output(raw: str) -> Tuple[List[str], List[str]]:
     """
     Parse structured ISSUES / SUGGESTIONS sections from LLM response.
 
-    Expected format:
+    Expected LLM response format:
         ISSUES:
         - issue one
         - issue two
@@ -326,18 +480,20 @@ def _parse_llm_output(raw: str) -> tuple[list[str], list[str]]:
         SUGGESTIONS:
         - suggestion one
 
+    Handles case-insensitive section headers and skips "- None" lines.
+
     Parameters
     ----------
     raw : str
-        Raw LLM response string.
+        Raw string content from LLM response.
 
     Returns
     -------
-    tuple[list[str], list[str]]
-        (issues, suggestions) — both may be empty lists.
+    Tuple[List[str], List[str]]
+        (issues, suggestions) — both may be empty lists if none found.
     """
-    issues: list[str] = []
-    suggestions: list[str] = []
+    issues: List[str] = []
+    suggestions: List[str] = []
     section = None
 
     for line in raw.splitlines():
@@ -363,7 +519,7 @@ def _parse_llm_output(raw: str) -> tuple[list[str], list[str]]:
 # ── Helper: Python file detection ─────────────────────────────────────────────
 
 def _has_python_files(files: list) -> bool:
-    """Return True if any changed file in the PR is a .py file."""
+    """Return True if any changed file in the PR ends with .py."""
     return any(
         str(f.get("filename", "")).endswith(".py")
         for f in files
@@ -371,7 +527,7 @@ def _has_python_files(files: list) -> bool:
 
 
 # =============================================================================
-# NODES
+# NODES — P1/P2 (unchanged)
 # =============================================================================
 
 @traceable(name="fetch_diff_node", tags=["github", "fetch"])
@@ -383,10 +539,11 @@ async def fetch_diff_node(state: ReviewState) -> Dict:
     Writes : state["metadata"], state["files"], state["diff"]
              state["error"], state["error_reason"] (on failure)
 
-    Failure behaviour
+    Failure Behaviour
     -----------------
     On GitHub API failure, sets error=True and error_reason="github_fetch_failed".
-    The workflow routes to hitl_node on error — human can inspect and decide.
+    check_error() in workflow.py routes directly to hitl_node on error.
+    Human can inspect the partial state and decide what to do.
     """
     owner = state["owner"]
     repo = state["repo"]
@@ -426,31 +583,266 @@ async def fetch_diff_node(state: ReviewState) -> Dict:
         }
 
 
+# =============================================================================
+# NODES — P4 NEW
+# =============================================================================
+
+@traceable(name="retrieve_context_node", tags=["chromadb", "rag", "p4"])
+async def retrieve_context_node(state: ReviewState) -> Dict:
+    """
+    Query ChromaDB for relevant codebase context for the current PR.
+
+    Uses the PR diff as the search query to find semantically similar
+    code chunks previously indexed from the same repository. Retrieved
+    context is passed to grade_context_node for relevance grading before
+    being injected into analyze_code_node.
+
+    Reads  : state["diff"], state["metadata"], state["error"]
+    Writes : state["raw_context"]  — raw retrieved docs (ungraded)
+
+    P4 Notes
+    --------
+    ChromaDB is empty until the indexing pipeline (POST /repos/index) runs.
+    If collection is empty or unavailable, raw_context is set to "" and
+    the graph continues without context — this is the expected behavior
+    before any repo has been indexed.
+
+    Failure Behaviour
+    -----------------
+    Any ChromaDB failure sets raw_context="" and continues.
+    The graph NEVER crashes on RAG failures — context is optional.
+    """
+    if state.get("error"):
+        logger.warning(
+            "[retrieve_context_node] Skipping — upstream error: %s",
+            state.get("error_reason"),
+        )
+        return {"raw_context": ""}
+
+    diff = state.get("diff", "")
+    metadata = state.get("metadata", {})
+    pr_title = metadata.get("title", "")
+    owner = state.get("owner", "")
+    repo = state.get("repo", "")
+
+    logger.info(
+        "[retrieve_context_node] Starting — %s/%s PR: '%s' diff=%d chars",
+        owner, repo, pr_title, len(diff),
+    )
+
+    collection, embedder = get_chroma_collection()
+
+    if not collection or not embedder:
+        logger.info(
+            "[retrieve_context_node] ChromaDB unavailable — "
+            "skipping retrieval, raw_context=''"
+        )
+        return {"raw_context": ""}
+
+    if collection.count() == 0:
+        logger.info(
+            "[retrieve_context_node] ChromaDB collection is empty — "
+            "no context available yet. "
+            "Run POST /repos/index to index the repository first."
+        )
+        return {"raw_context": ""}
+
+    try:
+        # Use diff + PR title as search query for best semantic match
+        query_text = f"{pr_title}\n{diff[:1000]}"
+
+        logger.info(
+            "[retrieve_context_node] Querying ChromaDB — "
+            "query_chars=%d collection_count=%d",
+            len(query_text), collection.count(),
+        )
+
+        query_embedding = embedder.embed_query(query_text)
+
+        results = collection.query(
+            query_embeddings=[query_embedding],
+            n_results=min(3, collection.count()),
+            include=["documents", "metadatas", "distances"],
+        )
+
+        docs = results.get("documents", [[]])[0]
+        metadatas = results.get("metadatas", [[]])[0]
+        distances = results.get("distances", [[]])[0]
+
+        if not docs:
+            logger.info(
+                "[retrieve_context_node] No results returned from ChromaDB"
+            )
+            return {"raw_context": ""}
+
+        # Format retrieved context with source metadata
+        context_parts = []
+        for doc, meta, dist in zip(docs, metadatas, distances):
+            source = meta.get("source", "unknown")
+            context_parts.append(
+                f"### {source} (similarity={1-dist:.2f})\n{doc}"
+            )
+
+        raw_context = "\n\n".join(context_parts)
+
+        logger.info(
+            "[retrieve_context_node] Retrieved %d chunk(s) — "
+            "total_chars=%d",
+            len(docs), len(raw_context),
+        )
+
+        return {"raw_context": raw_context}
+
+    except Exception as e:
+        logger.warning(
+            "[retrieve_context_node] ChromaDB query failed — "
+            "continuing without context. error=%s",
+            str(e),
+        )
+        return {"raw_context": ""}
+
+
+@traceable(name="grade_context_node", tags=["llm", "rag", "crag", "p4"])
+async def grade_context_node(state: ReviewState) -> Dict:
+    """
+    Grade the relevance of retrieved ChromaDB context for the current PR.
+
+    Implements the Corrective RAG (CRAG) pattern — ask Gemini whether
+    the retrieved context is actually relevant to the PR diff before
+    injecting it into the analysis prompt. This prevents irrelevant
+    context from confusing the analyzer.
+
+    If the grade is "yes":  repo_context = raw_context (passed to analyzer)
+    If the grade is "no":   repo_context = ""          (no context injected)
+    If LLM fails:           repo_context = raw_context (fail open — use context)
+
+    Reads  : state["raw_context"], state["diff"], state["error"]
+    Writes : state["repo_context"]  — graded context (empty if irrelevant)
+             state["context_grade"] — "yes" | "no" | "skipped"
+
+    Failure Behaviour
+    -----------------
+    On LLM failure, fails OPEN — passes raw_context through unchanged.
+    This is intentional: better to include potentially irrelevant context
+    than to drop relevant context due to a grading LLM failure.
+    The HITL gate still fires so a human can review the output.
+    """
+    if state.get("error"):
+        logger.warning(
+            "[grade_context_node] Skipping — upstream error: %s",
+            state.get("error_reason"),
+        )
+        return {"repo_context": "", "context_grade": "skipped"}
+
+    raw_context = state.get("raw_context", "")
+    diff = state.get("diff", "")
+
+    # No context to grade — skip LLM call
+    if not raw_context:
+        logger.info(
+            "[grade_context_node] No raw_context to grade — "
+            "skipping LLM call, repo_context=''"
+        )
+        return {"repo_context": "", "context_grade": "skipped"}
+
+    logger.info(
+        "[grade_context_node] Grading retrieved context — "
+        "raw_context_chars=%d diff_chars=%d",
+        len(raw_context), len(diff),
+    )
+
+    prompt = [
+        SystemMessage(content=(
+            "You are a relevance grader for a code review system.\n\n"
+            "Your job is to determine if retrieved codebase context is "
+            "relevant to a given PR diff.\n\n"
+            "Respond with ONLY one word: 'yes' or 'no'.\n"
+            "- 'yes' if the context contains code, patterns, or conventions "
+            "that would help review the PR diff.\n"
+            "- 'no' if the context is unrelated to the PR changes."
+        )),
+        HumanMessage(content=(
+            f"--- Retrieved Context ---\n{raw_context[:1000]}\n\n"
+            f"--- PR Diff ---\n{diff[:1000]}\n\n"
+            "Is this context relevant to reviewing this PR diff? "
+            "Respond with ONLY 'yes' or 'no'."
+        )),
+    ]
+
+    result = await safe_llm_invoke(prompt)
+
+    # Handle LLM failures — fail open (use context)
+    if result in (FREE_TIER_EXHAUSTED, LLM_ERROR):
+        logger.warning(
+            "[grade_context_node] LLM unavailable (%s) — "
+            "failing open, passing raw_context through",
+            result,
+        )
+        return {
+            "repo_context": raw_context[:MAX_CONTEXT_CHARS],
+            "context_grade": "skipped",
+        }
+
+    grade = result.strip().lower()
+
+    # Normalize to yes/no — LLM sometimes adds punctuation
+    if "yes" in grade:
+        grade = CONTEXT_GRADE_YES
+    elif "no" in grade:
+        grade = CONTEXT_GRADE_NO
+    else:
+        logger.warning(
+            "[grade_context_node] Unexpected grade response: '%s' — "
+            "defaulting to 'yes' (fail open)",
+            result.strip(),
+        )
+        grade = CONTEXT_GRADE_YES
+
+    if grade == CONTEXT_GRADE_YES:
+        logger.info(
+            "[grade_context_node] Grade=YES — "
+            "context is relevant, injecting into analyzer "
+            "context_chars=%d",
+            min(len(raw_context), MAX_CONTEXT_CHARS),
+        )
+        return {
+            "repo_context": raw_context[:MAX_CONTEXT_CHARS],
+            "context_grade": grade,
+        }
+    else:
+        logger.info(
+            "[grade_context_node] Grade=NO — "
+            "context not relevant, discarding"
+        )
+        return {
+            "repo_context": "",
+            "context_grade": grade,
+        }
+
+
 @traceable(name="analyze_code_node", tags=["llm", "analysis"])
 async def analyze_code_node(state: ReviewState) -> Dict:
     """
     Use Gemini to analyze the PR diff and identify issues and suggestions.
 
-    Reads  : state["diff"], state["metadata"], state["error"]
+    P4 Update: Now includes graded repo_context in the analysis prompt
+    when available, giving Gemini awareness of the existing codebase
+    conventions and patterns.
+
+    Reads  : state["diff"], state["metadata"], state["repo_context"],
+             state["error"]
     Writes : state["issues"], state["suggestions"], state["repo_context"]
              state["error"], state["error_reason"] (on hard failure)
 
     LLM Failure Behaviour
     ---------------------
-    FREE_TIER_EXHAUSTED
-        Returns issues=["LLM quota exhausted — manual review required"].
-        Graph continues to HITL gate with degraded output.
-
-    LLM_ERROR
-        Returns issues=["LLM error — manual review required"].
-        Graph continues to HITL gate with degraded output.
-
-    In both cases error=False so the graph does NOT short-circuit —
-    the HITL gate fires and a human can inspect the partial results.
+    FREE_TIER_EXHAUSTED → degraded output, graph continues to HITL
+    LLM_ERROR           → degraded output, graph continues to HITL
+    In both cases error=False — HITL gate fires for human inspection.
     """
     if state.get("error"):
         logger.warning(
-            "[analyze_code_node] Skipping — upstream error detected: %s",
+            "[analyze_code_node] Skipping — upstream error: %s",
             state.get("error_reason"),
         )
         return {}
@@ -458,11 +850,24 @@ async def analyze_code_node(state: ReviewState) -> Dict:
     diff = state.get("diff", "")
     metadata = state.get("metadata", {})
     pr_title = metadata.get("title", "Unknown PR")
+    repo_context = state.get("repo_context", "")
+    context_grade = state.get("context_grade", "skipped")
 
     logger.info(
-        "[analyze_code_node] Starting analysis — PR: '%s' diff=%d chars",
-        pr_title, len(diff),
+        "[analyze_code_node] Starting analysis — "
+        "PR: '%s' diff=%d chars context=%d chars context_grade=%s",
+        pr_title, len(diff), len(repo_context), context_grade,
     )
+
+    # Build context section for prompt
+    context_section = ""
+    if repo_context:
+        context_section = (
+            f"\n\n--- Codebase Context (from repository index) ---\n"
+            f"{repo_context}\n\n"
+            f"Use the above context to understand existing conventions "
+            f"and patterns when reviewing the diff below.\n"
+        )
 
     prompt = [
         SystemMessage(content=(
@@ -476,8 +881,9 @@ async def analyze_code_node(state: ReviewState) -> Dict:
             "Be specific. Reference filenames and line context where possible."
         )),
         HumanMessage(content=(
-            f"PR Title: {pr_title}\n\n"
-            f"--- PR Diff ---\n{diff[:MAX_DIFF_CHARS]}"
+            f"PR Title: {pr_title}"
+            f"{context_section}"
+            f"\n\n--- PR Diff ---\n{diff[:MAX_DIFF_CHARS]}"
         )),
     ]
 
@@ -491,7 +897,6 @@ async def analyze_code_node(state: ReviewState) -> Dict:
         return {
             "issues": ["LLM quota exhausted — manual review required"],
             "suggestions": [],
-            "repo_context": "",
             "error": False,
         }
 
@@ -503,7 +908,6 @@ async def analyze_code_node(state: ReviewState) -> Dict:
         return {
             "issues": ["LLM error — manual review required"],
             "suggestions": [],
-            "repo_context": "",
             "error": False,
         }
 
@@ -517,7 +921,6 @@ async def analyze_code_node(state: ReviewState) -> Dict:
     return {
         "issues": issues,
         "suggestions": suggestions,
-        "repo_context": "",
         "error": False,
     }
 
@@ -527,8 +930,11 @@ async def reflect_node(state: ReviewState) -> Dict:
     """
     Self-reflection pass — ask Gemini to find anything it missed.
 
-    Runs up to 2 times (controlled by should_reflect() in workflow.py).
-    On LLM failure, increments counter and returns existing state unchanged
+    Controlled by REFLECTION_PASSES in workflow.py.
+    Set to 0 in development (skipped entirely).
+    Set to 1 in staging/production for one additional pass.
+
+    On LLM failure, increments counter and returns existing issues unchanged
     so the graph can proceed rather than stalling.
 
     Reads  : state["issues"], state["suggestions"], state["diff"],
@@ -543,9 +949,7 @@ async def reflect_node(state: ReviewState) -> Dict:
     logger.info(
         "[reflect_node] Pass #%d starting — "
         "current issues=%d suggestions=%d",
-        current_count + 1,
-        len(existing_issues),
-        len(existing_suggestions),
+        current_count + 1, len(existing_issues), len(existing_suggestions),
     )
 
     prompt = [
@@ -577,6 +981,7 @@ async def reflect_node(state: ReviewState) -> Dict:
 
     new_issues, new_suggestions = _parse_llm_output(result)
 
+    # Deduplicate by lowercase key while preserving original case
     merged_issues = list(
         {i.lower(): i for i in existing_issues + new_issues}.values()
     )
@@ -587,9 +992,7 @@ async def reflect_node(state: ReviewState) -> Dict:
     logger.info(
         "[reflect_node] Pass #%d complete — "
         "added %d issue(s), %d suggestion(s)",
-        current_count + 1,
-        len(new_issues),
-        len(new_suggestions),
+        current_count + 1, len(new_issues), len(new_suggestions),
     )
 
     return {
@@ -606,7 +1009,7 @@ async def lint_node(state: ReviewState) -> Dict:
 
     Skips gracefully if:
         - No Python files in the PR diff
-        - Docker sandbox unavailable
+        - Docker sandbox unavailable (Docker Desktop not running)
 
     Reads  : state["diff"], state["files"]
     Writes : state["lint_result"], state["lint_passed"]
@@ -711,9 +1114,7 @@ async def refactor_node(state: ReviewState) -> Dict:
             "suggestions": suggestions + ["Refactor skipped — LLM unavailable"],
         }
 
-    logger.info(
-        "[refactor_node] Patch generated — %d chars", len(result),
-    )
+    logger.info("[refactor_node] Patch generated — %d chars", len(result))
 
     return {
         "patch": result.strip(),
@@ -726,8 +1127,8 @@ async def validator_node(state: ReviewState) -> Dict:
     """
     Run ruff + pytest on the generated patch inside the Docker sandbox.
 
-    The result determines whether the refactor loop continues or
-    the workflow proceeds to hitl_node.
+    The result determines whether the refactor loop continues (validation
+    failed, attempts remaining) or the workflow proceeds to memory_write_node.
 
     Reads  : state["patch"], state["refactor_count"]
     Writes : state["validation_result"], state["validation_passed"],
@@ -741,9 +1142,7 @@ async def validator_node(state: ReviewState) -> Dict:
     )
 
     if not patch or ".py" not in patch:
-        logger.info(
-            "[validator_node] No Python patch to validate — skipping"
-        )
+        logger.info("[validator_node] No Python patch to validate — skipping")
         return {
             "validation_passed": True,
             "validation_result": "SKIPPED_NO_PYTHON_PATCH",
@@ -797,13 +1196,137 @@ async def validator_node(state: ReviewState) -> Dict:
         }
 
 
+@traceable(name="memory_write_node", tags=["chromadb", "memory", "p4"])
+async def memory_write_node(state: ReviewState) -> Dict:
+    """
+    Write review findings to ChromaDB long-term memory after each review.
+
+    After each completed review, key findings (issues, verdict, PR title)
+    are embedded and stored in ChromaDB. Future reviews on the same repo
+    will retrieve these findings via retrieve_context_node, making the
+    reviewer progressively more codebase-aware over time.
+
+    This node always returns an empty dict — it has no state outputs.
+    It only writes to ChromaDB as a side effect.
+
+    Reads  : state["issues"], state["suggestions"], state["verdict"],
+             state["metadata"], state["owner"], state["repo"]
+    Writes : {} (no state changes — ChromaDB write is a side effect)
+
+    Failure Behaviour
+    -----------------
+    Any ChromaDB write failure is logged as a warning and the graph
+    continues. Memory writes are best-effort — a failure here should
+    never block the review from completing.
+
+    Notes
+    -----
+    Each memory entry is stored with metadata:
+        - source: "{owner}/{repo}"
+        - type: "review_memory"
+        - pr_title: PR title
+        - verdict: final verdict
+    This metadata enables future filtering by repo when querying.
+    """
+    if state.get("error"):
+        logger.warning(
+            "[memory_write_node] Skipping — upstream error: %s",
+            state.get("error_reason"),
+        )
+        return {}
+
+    issues = state.get("issues", [])
+    suggestions = state.get("suggestions", [])
+    metadata = state.get("metadata", {})
+    pr_title = metadata.get("title", "Unknown PR")
+    pr_author = metadata.get("author", "unknown")
+    owner = state.get("owner", "")
+    repo = state.get("repo", "")
+    pr_number = state.get("pr_number", 0)
+    verdict = state.get("verdict", "")
+
+    logger.info(
+        "[memory_write_node] Writing review memory — "
+        "%s/%s#%d PR: '%s' issues=%d verdict=%s",
+        owner, repo, pr_number, pr_title, len(issues), verdict,
+    )
+
+    collection, embedder = get_chroma_collection()
+
+    if not collection or not embedder:
+        logger.info(
+            "[memory_write_node] ChromaDB unavailable — skipping memory write"
+        )
+        return {}
+
+    if not issues and not suggestions:
+        logger.info(
+            "[memory_write_node] No issues or suggestions to store — "
+            "skipping memory write (APPROVE verdict with no findings)"
+        )
+        return {}
+
+    try:
+        # Build memory document text
+        issues_text = "\n".join(f"- {i}" for i in issues) if issues else "None"
+        suggestions_text = (
+            "\n".join(f"- {s}" for s in suggestions)
+            if suggestions else "None"
+        )
+
+        memory_doc = (
+            f"PR Review Memory — {owner}/{repo}#{pr_number}\n"
+            f"Title: {pr_title}\n"
+            f"Author: @{pr_author}\n"
+            f"Verdict: {verdict}\n\n"
+            f"Issues Found:\n{issues_text}\n\n"
+            f"Suggestions:\n{suggestions_text}"
+        )
+
+        # Generate unique document ID
+        doc_id = f"review_memory_{owner}_{repo}_{pr_number}_{int(time.time())}"
+
+        # Embed and store
+        embedding = embedder.embed_query(memory_doc)
+
+        collection.add(
+            ids=[doc_id],
+            embeddings=[embedding],
+            documents=[memory_doc],
+            metadatas=[{
+                "source":   f"{owner}/{repo}",
+                "type":     "review_memory",
+                "pr_title": pr_title,
+                "pr_number": str(pr_number),
+                "verdict":  verdict,
+                "author":   pr_author,
+            }],
+        )
+
+        logger.info(
+            "[memory_write_node] Memory written successfully — "
+            "doc_id=%s collection_count=%d",
+            doc_id, collection.count(),
+        )
+
+    except Exception as e:
+        logger.warning(
+            "[memory_write_node] ChromaDB write failed — "
+            "graph continues without memory write. error=%s",
+            str(e),
+        )
+
+    return {}
+
+
 @traceable(name="verdict_node", tags=["verdict"])
 async def verdict_node(state: ReviewState) -> Dict:
     """
     Produce the final verdict and GitHub PR comment markdown.
 
-    Reads human_decision first — if 'rejected', short-circuits immediately.
+    Checks human_decision first — rejected produces HUMAN_REJECTED.
     Otherwise determines APPROVE or REQUEST_CHANGES from issues list.
+    On upstream error, produces FAILED verdict with error details.
 
     Reads  : state["human_decision"], state["issues"], state["suggestions"],
              state["metadata"], state["error"], state["error_reason"]
@@ -815,10 +1338,12 @@ async def verdict_node(state: ReviewState) -> Dict:
     metadata = state.get("metadata", {})
     pr_title = metadata.get("title", "Unknown PR")
     pr_author = metadata.get("author", "unknown")
+    context_grade = state.get("context_grade", "skipped")
 
     logger.info(
-        "[verdict_node] Starting — human_decision=%r issues=%d suggestions=%d",
-        human_decision, len(issues), len(suggestions),
+        "[verdict_node] Starting — human_decision=%r issues=%d "
+        "suggestions=%d context_grade=%s",
+        human_decision, len(issues), len(suggestions), context_grade,
     )
 
     # ── Error path ────────────────────────────────────────────────────────────
@@ -842,7 +1367,7 @@ async def verdict_node(state: ReviewState) -> Dict:
     if human_decision == "rejected":
         logger.info(
             "[verdict_node] human_decision=rejected — "
-            "producing HUMAN_REJECTED, no GitHub comment will be posted"
+            "HUMAN_REJECTED, no GitHub comment posted"
         )
         return {
             "verdict": "HUMAN_REJECTED",
@@ -881,12 +1406,20 @@ async def verdict_node(state: ReviewState) -> Dict:
         else ""
     )
 
+    # Context badge — shows whether RAG context was used
+    context_badge = ""
+    if context_grade == CONTEXT_GRADE_YES:
+        context_badge = "\n**Context:** 🧠 Codebase context used"
+    elif context_grade == CONTEXT_GRADE_NO:
+        context_badge = "\n**Context:** ⚪ Retrieved context not relevant"
+
     summary = (
         f"## {verdict_emoji} AI Code Review\n\n"
         f"**PR:** {pr_title}\n"
         f"**Author:** @{pr_author}\n"
         f"**Verdict:** `{verdict}`"
-        f"{human_badge}\n\n"
+        f"{human_badge}"
+        f"{context_badge}\n\n"
         f"---\n\n"
         f"### 🐛 Issues\n{issues_section}\n\n"
         f"### 💡 Suggestions\n{suggestions_section}\n\n"

@@ -1,7 +1,7 @@
 """
 app/main.py
 
-FastAPI Application Entry Point — P3 Production Version
+FastAPI Application Entry Point — P4 Production Version
 --------------------------------------------------------
 Creates the FastAPI application, registers all routers, runs database
 initialization on startup, and provides global exception handling.
@@ -21,6 +21,13 @@ Registered Routers
     /reviews            ← Review CRUD + trigger + HITL decision (P1/P3)
     /chat               ← Thread-based messaging stub (P1, fully wired P5)
     /reviews (HITL)     ← approve / reject / status endpoints (P3)
+    /repos              ← Repository indexing for ChromaDB RAG (P4)
+
+P4 New Endpoints
+----------------
+    POST   /repos/index                  — clone + chunk + embed + store
+    GET    /repos/{owner}/{repo}/status  — check if repo is indexed
+    DELETE /repos/{owner}/{repo}/index   — clear repo chunks from ChromaDB
 
 Route Conflict Note
 -------------------
@@ -32,7 +39,7 @@ there. Defining it here after include_router() ensures correct ordering.
 Startup Lifecycle
 -----------------
 on_startup() runs once when uvicorn starts:
-    1. Creates all SQLAlchemy tables if they don't exist (create_all)
+    1. Creates all SQLAlchemy tables if they do not exist (create_all)
     2. Logs environment, DB, and LangSmith config for verification
     Failure here raises RuntimeError — server refuses to start
     with a clear log message rather than silently serving broken requests.
@@ -60,6 +67,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.routes import webhook, review, chat
 from app.api.routes.hitl import router as hitl_router
+from app.api.routes.repos import router as repos_router
 from app.core.config import settings
 from app.core.exceptions import CustomException
 from app.core.logger import get_logger
@@ -77,13 +85,17 @@ app = FastAPI(
     title="Advanced GitHub Code Reviewer",
     description=(
         "Agentic AI platform that automatically reviews GitHub Pull Requests "
-        "using LangGraph, Gemini 2.0 Flash, PostgreSQL, and Docker sandbox.\n\n"
+        "using LangGraph, Gemini 2.5 Flash Lite, PostgreSQL, Docker sandbox, "
+        "and ChromaDB RAG.\n\n"
         "**HITL Flow:**\n"
         "1. `POST /reviews/trigger` — run AI review, pauses at HITL gate\n"
         "2. `POST /reviews/id/{id}/decision` — approve or reject\n"
-        "3. Review completes, GitHub comment posted (if approved)"
+        "3. Review completes, GitHub comment posted (if approved)\n\n"
+        "**RAG Flow (P4):**\n"
+        "1. `POST /repos/index` — index a repository into ChromaDB\n"
+        "2. Trigger reviews normally — context injected automatically"
     ),
-    version="3.0.1",
+    version="4.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
 )
@@ -167,8 +179,8 @@ async def on_startup() -> None:
         If database initialization fails.
     """
     logger.info(
-        "[startup] Starting Advanced GitHub Code Reviewer P3 — "
-        "version=3.0.1"
+        "[startup] Starting Advanced GitHub Code Reviewer P4 — "
+        "version=4.0.0"
     )
 
     try:
@@ -240,9 +252,9 @@ async def global_exception_handler(
     """
     Catch-all handler for any unhandled exception.
 
-    This fires for exceptions that are not HTTPException and not
-    CustomException. Logs the full traceback at DEBUG level for
-    development, and returns a generic error message to the client.
+    Fires for exceptions that are not HTTPException and not CustomException.
+    Logs the full traceback at DEBUG level for development and returns
+    a generic error message to the client.
 
     Parameters
     ----------
@@ -274,10 +286,11 @@ app.include_router(webhook.router)
 app.include_router(review.router)
 app.include_router(chat.router)
 app.include_router(hitl_router)
+app.include_router(repos_router)        # ← P4: /repos/index, /repos/status
 
 logger.info(
     "[startup] Routers registered — "
-    "/webhook, /reviews, /chat, /reviews (HITL)"
+    "/webhook, /reviews, /chat, /reviews (HITL), /repos (P4 RAG)"
 )
 
 
@@ -302,8 +315,8 @@ async def get_all_reviews(
     """
     List all reviews across all repositories.
 
-    Returns enriched dicts with PR number, repo name, and PR title
-    for the Streamlit dashboard display. Ordered by most recent first.
+    Returns enriched dicts with PR number, repo name, PR title, author,
+    branch, and thread_id for the Streamlit dashboard. Newest first.
     """
     logger.info("[get_all_reviews] Dashboard request — fetching all reviews")
 
@@ -329,18 +342,21 @@ async def get_all_reviews(
     "/health",
     tags=["health"],
     summary="Health check",
-    description="Returns server status. Used by load balancers and uptime monitors.",
+    description=(
+        "Returns server status and version. "
+        "Used by load balancers, uptime monitors, and Docker health checks."
+    ),
 )
 async def health_check() -> dict:
     """
     Return server health status.
 
-    Used by Docker health checks, load balancers, and uptime monitors.
-    Does not check database connectivity — for a deep health check,
-    add a simple SELECT 1 query here in P6.
+    Does not check database connectivity — add a SELECT 1 query in P6
+    for a deep health check that verifies DB connection is alive.
     """
     return {
         "status":      "ok",
-        "version":     "3.0.1",
+        "version":     "4.0.0",
+        "phase":       "P4",
         "environment": settings.ENVIRONMENT,
     }

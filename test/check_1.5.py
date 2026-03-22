@@ -3,7 +3,9 @@ from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage, SystemMessage
 
 # 1. Setup API Key (or set as environment variable)
-os.environ["GOOGLE_API_KEY"] = "AIzaSyA_PKObaCLSE5qiu-wKZ7alTxw_NWjvmMg"
+from dotenv import load_dotenv
+load_dotenv()
+api_key = os.environ.get("GOOGLE_API_KEY")
 
 def test_gemini_init():
     # 2. Initialize using the unified factory method
