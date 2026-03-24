@@ -264,22 +264,30 @@ def _chunk_file(
 def _discover_files(repo_path: str) -> List[Tuple[str, str]]:
     """
     Walk repo_path and return (relative_path, absolute_path) for indexable files.
-
-    Filters by FILE_EXTENSIONS and MAX_FILE_SIZE_KB.
-    Skips hidden directories (starting with '.') and __pycache__.
-
-    Parameters
-    ----------
-    repo_path : str
-        Absolute path to the cloned repository root.
-
-    Returns
-    -------
-    List[Tuple[str, str]]
-        List of (relative_path, absolute_path) tuples for files to index.
+    
+    🔍 DEBUG ADDITION: 
+    Logs a full manifest of EVERY file found in the temp directory 
+    before filtering logic applies.
     """
     files = []
     repo_root = Path(repo_path)
+    
+    # --- 🟢 MANIFEST LOGGING START ---
+    all_discovered_files = []
+    try:
+        for p in repo_root.rglob("*"):
+            if p.is_file():
+                all_discovered_files.append(str(p.relative_to(repo_root)))
+        
+        logger.info(
+            "[indexing_service] 📜 REPO MANIFEST (%d total files found):", 
+            len(all_discovered_files)
+        )
+        for f in sorted(all_discovered_files):
+            logger.info(f"  📄 {f}")
+    except Exception as log_e:
+        logger.warning("[indexing_service] Failed to generate manifest log: %s", str(log_e))
+    # --- 🟢 MANIFEST LOGGING END ---
 
     for abs_path in repo_root.rglob("*"):
         # Skip directories
@@ -293,6 +301,8 @@ def _discover_files(repo_path: str) -> List[Tuple[str, str]]:
 
         # Filter by extension
         if abs_path.suffix not in FILE_EXTENSIONS:
+            # Optional: Log why it's skipped if you need more detail
+            # logger.debug("[indexing_service] Extension skip: %s", abs_path.name)
             continue
 
         # Skip oversized files
@@ -311,7 +321,7 @@ def _discover_files(repo_path: str) -> List[Tuple[str, str]]:
         files.append((relative_path, str(abs_path)))
 
     logger.info(
-        "[indexing_service] _discover_files: found %d file(s) in %s",
+        "[indexing_service] _discover_files: %d file(s) passed filters in %s",
         len(files), repo_path,
     )
     return files

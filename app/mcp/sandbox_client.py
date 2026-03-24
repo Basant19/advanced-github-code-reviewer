@@ -2,65 +2,6 @@
 app/mcp/sandbox_client.py
 =========================
 MCP wrapper between LangGraph nodes and DockerRunner.
-
-RESPONSIBILITY
---------------
-This file sits between nodes.py and docker_runner.py. It does two things:
-  1. Parse a unified diff string into {filename: content} that docker_runner
-     can write to disk and lint/test.
-  2. Call DockerRunner.run() and return the SandboxResult to the node.
-
-This file knows NOTHING about:
-  - LangGraph state         (that is nodes.py's job)
-  - Docker SDK              (that is docker_runner.py's job)
-  - review records          (that is review_service.py's job)
-
-WHY THIS LAYER EXISTS (MCP pattern)
-------------------------------------
-nodes.py should not know HOW the sandbox works — only WHAT to ask for.
-docker_runner.py should not know what a diff is — only HOW to run a container.
-sandbox_client.py is the translator between the two.
-
-This is the Model Context Protocol pattern: a standardised interface that
-the agent calls, with the implementation detail hidden behind it. If we
-swap Docker for a different sandbox later, only this file changes.
-
-CALL CHAIN
-----------
-  nodes.py
-    lint_node      → sandbox_client.run_lint(diff)   → SandboxResult
-    validator_node → sandbox_client.run_tests(patch)  → SandboxResult
-      → docker_runner.py  write files → run container → SandboxResult
-
-HOW DIFF PARSING WORKS
------------------------
-A GitHub unified diff looks like this:
-
-    diff --git a/app/utils.py b/app/utils.py
-    --- a/app/utils.py
-    +++ b/app/utils.py
-    @@ -1,3 +1,3 @@
-    -def add(x,y):
-    +def add(x, y):
-         return x + y
-
-We need the POST-PATCH version of each file to lint it.
-To reconstruct it we take:
-  - Lines starting with "+" (added lines)  → strip the leading "+"
-  - Lines starting with " " (context lines) → keep as-is
-  - Lines starting with "-" (removed lines) → skip entirely
-
-This gives us what the file looks like AFTER the PR changes are applied.
-We do NOT need a full patch-apply engine — we are linting, not merging.
-
-EXCEPTION HANDLING
-------------------
-SandboxError and subclasses from docker_runner.py are allowed to propagate
-up to the calling node. The node catches them and writes the failure to
-the ReviewStep audit trail in PostgreSQL.
-
-ParseError (defined here) is raised when the diff is malformed or empty
-in a way that prevents any files from being extracted.
 """
 
 from __future__ import annotations
@@ -81,14 +22,7 @@ logger = get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 class ParseError(CustomException):
-    """
-    Raised when the unified diff cannot be parsed into any files.
-
-    This means the diff is either empty, malformed, or contains only
-    binary file changes that cannot be linted as Python source.
-
-    Extends CustomException so the error carries file + line context.
-    """
+    """Raised when the unified diff cannot be parsed."""
     pass
 
 
@@ -97,256 +31,226 @@ class ParseError(CustomException):
 # ---------------------------------------------------------------------------
 
 class SandboxClient:
-    """
-    MCP client for the Docker sandbox execution environment.
-
-    Instantiated once per review run. Reuses the same DockerRunner
-    instance across lint and test calls for that review — avoids
-    re-connecting to the Docker daemon unnecessarily.
-
-    Usage (from nodes.py)
-    ---------------------
-        client = SandboxClient()
-
-        # In lint_node:
-        lint_result = client.run_lint(state["diff"])
-
-        # In validator_node:
-        test_result = client.run_tests(state["patch"])
-    """
-
     def __init__(self) -> None:
         self._runner = DockerRunner()
 
-    # ── Public API ──────────────────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────
+    # PUBLIC API
+    # ──────────────────────────────────────────────────────────
 
     def run_lint(self, diff: str) -> SandboxResult:
-        """
-        Parse a unified diff and run ruff on the post-patch file contents.
-
-        Called by lint_node in nodes.py with state["diff"] — the raw
-        unified diff text fetched from GitHub by fetch_diff_node.
-
-        Parameters
-        ----------
-        diff : str
-            Unified diff string from GitHub API (get_pr_diff output).
-
-        Returns
-        -------
-        SandboxResult
-            passed=True  → ruff found no issues — proceed to analyze_code_node
-            passed=False → ruff found issues — route directly to refactor_node
-                           (fail-fast: skip Gemini reviewer, save tokens)
-
-        Raises
-        ------
-        ParseError    — diff is empty or contains no parseable Python files
-        SandboxError  — Docker infrastructure failure
-        """
         logger.info("sandbox_client: Starting lint run")
 
+        # 🔍 RAW DIFF DEBUG (CRITICAL)
+        logger.debug(f"[sandbox_debug] RAW DIFF PREVIEW:\n{diff[:1000]}")
+
         files = self._parse_diff(diff)
-        logger.info(
-            f"sandbox_client: Parsed {len(files)} file(s) from diff for lint"
-        )
+
+        # 🔍 Payload snapshot
+        self._log_payload(files, "LINT")
 
         result = self._runner.run(files=files, run_type=RunType.LINT)
 
-        logger.info(
-            f"sandbox_client: Lint complete — {result.summary}"
-        )
+        logger.info(f"sandbox_client: Lint complete — {result.summary}")
         return result
 
     def run_tests(self, patch: str) -> SandboxResult:
-        """
-        Parse a patch generated by refactor_node and run ruff + pytest.
-
-        Called by validator_node in nodes.py with state["patch"] — the
-        corrective patch generated by Gemini refactor_node.
-
-        The command inside the container is:
-            ruff check /sandbox && pytest /sandbox --timeout=10 -q
-        ruff runs first — if it fails, pytest is skipped entirely.
-
-        Parameters
-        ----------
-        patch : str
-            Unified diff / patch string generated by Gemini refactor_node.
-            Same format as a GitHub diff.
-
-        Returns
-        -------
-        SandboxResult
-            passed=True  → ruff + pytest both pass — proceed to verdict_node
-            passed=False → failures found — loop back to refactor_node
-
-        Raises
-        ------
-        ParseError    — patch is empty or contains no parseable Python files
-        SandboxError  — Docker infrastructure failure
-        """
         logger.info("sandbox_client: Starting test run")
 
+        # 🔍 RAW PATCH DEBUG
+        logger.debug(f"[sandbox_debug] RAW PATCH PREVIEW:\n{patch[:1000]}")
+
         files = self._parse_diff(patch)
-        logger.info(
-            f"sandbox_client: Parsed {len(files)} file(s) from patch for test"
-        )
+
+        # 🔍 Payload snapshot
+        self._log_payload(files, "TEST")
 
         result = self._runner.run(files=files, run_type=RunType.TEST)
 
-        logger.info(
-            f"sandbox_client: Test run complete — {result.summary}"
-        )
+        logger.info(f"sandbox_client: Test run complete — {result.summary}")
         return result
 
     def is_available(self) -> bool:
-        """
-        Returns True if Docker is running and the sandbox image is built.
-        Delegates directly to DockerRunner.is_available().
-        Used by tests to skip Docker-dependent tests gracefully.
-        """
         return self._runner.is_available()
 
-    # ── Private: Diff parsing ───────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────
+    # DEBUG HELPERS
+    # ──────────────────────────────────────────────────────────
+
+    def _log_payload(self, files: dict[str, str], context: str) -> None:
+        """Log exactly what is sent to Docker."""
+        if not files:
+            logger.warning(f"[sandbox_debug] {context} payload is EMPTY")
+            return
+
+        logger.info(f"[sandbox_debug] Sending {len(files)} file(s) to Docker for {context}")
+
+        for filename, content in files.items():
+            logger.info(f"  -> {filename} ({len(content)} chars)")
+            logger.debug(
+                f"[sandbox_debug] CONTENT PREVIEW ({filename}):\n{content[:300]}"
+            )
+
+    # ──────────────────────────────────────────────────────────
+    # DIFF PARSER
+    # ──────────────────────────────────────────────────────────
 
     def _parse_diff(self, diff: str) -> dict[str, str]:
         """
-        Parse a unified diff string into {relative_path: file_content}.
+        Production-grade unified diff parser
 
-        Only Python files (.py) are extracted — ruff and pytest operate
-        on Python source only. Other file types (markdown, yaml, json)
-        are silently skipped.
+        Handles:
+        ✔ Standard Git diff (+++ b/file.py)
+        ✔ GitHub simplified diff (--- file.py (modified))
+        ✔ New files (/dev/null → file.py)
+        ✔ Deleted files (skipped safely)
+        ✔ Simplified diffs (no context lines)
+        ✔ Silent parsing failures (logged)
 
-        Algorithm
-        ---------
-        For each file in the diff:
-          1. Find the +++ b/filename header to get the filename
-          2. Collect all hunk lines:
-             - lines starting with "+"  → add line (strip leading "+")
-             - lines starting with " "  → context line (keep as-is)
-             - lines starting with "-"  → removed line (skip entirely)
-          3. Reconstruct file content from collected lines
-          4. Store as files[filename] = content
-
-        This gives us the post-patch version of each file — what the
-        file looks like AFTER the PR changes are applied.
-
-        Parameters
-        ----------
-        diff : str
-            Unified diff string — from GitHub API or Gemini refactor output.
-
-        Returns
-        -------
-        dict[str, str]
-            {relative_file_path: reconstructed_file_content}
-            Example: {"app/utils.py": "def add(x, y):\n    return x + y\n"}
-
-        Raises
-        ------
-        ParseError
-            If the diff is empty, contains no Python files, or is so
-            malformed that no files could be extracted.
+        Returns:
+            dict[str, str] → {filename: reconstructed_content}
         """
+
         if not diff or not diff.strip():
-            raise ParseError("Diff is empty — nothing to lint or test.", sys)
+            logger.warning("[parse_diff]  Empty diff received")
+            return {}
 
         files: dict[str, str] = {}
         current_file: Optional[str] = None
         current_lines: list[str] = []
 
-        for line in diff.splitlines():
+        # ─────────────────────────────────────────────
+        # Patterns
+        # ─────────────────────────────────────────────
+        plus_plus_re = re.compile(r"^\+\+\+\s+(?:[abciw][\\/])?([^\s]+)")
+        modified_re = re.compile(r"^---\s+([^\s]+)\s+\(modified\)")
+        new_file_re = re.compile(r"^\+\+\+\s+(?:[abciw][\\/])?(.+)")  # for new files
 
-            # ── Detect start of a new file in the diff ──────────────────
-            # "+++ b/app/utils.py" → extract "app/utils.py"
-            if line.startswith("+++ b/"):
-                # Save the previous file before starting a new one
+        skipped_files = 0
+        detected_files = 0
+
+        logger.info("[parse_diff] 🚀 START parsing")
+        logger.debug(f"[parse_diff] Diff preview (first 500 chars):\n{diff[:500]}")
+
+        try:
+            lines = diff.splitlines()
+
+            for idx, line in enumerate(lines):
+
+                # ─────────────────────────────
+                # 1. Detect file headers
+                # ─────────────────────────────
+                plus_match = plus_plus_re.match(line)
+                mod_match = modified_re.match(line)
+
+                match = plus_match or mod_match
+
+                if match:
+                    new_path = match.group(1).replace("\\", "/").strip()
+                    detected_files += 1
+
+                    header_type = "+++" if plus_match else "--- (modified)"
+                    logger.info(f"[parse_diff] Detected via {header_type}: {new_path}")
+
+                    # Save previous file
+                    if current_file:
+                        content = "\n".join(current_lines).strip()
+
+                        if content:
+                            files[current_file] = content
+                            logger.info(f"[parse_diff]  Saved file={current_file} lines={len(current_lines)}")
+                        else:
+                            logger.warning(f"[parse_diff]  EMPTY file skipped: {current_file}")
+
+                    # Reset state
+                    current_file = None
+                    current_lines = []
+
+                    # Skip deleted file
+                    if new_path == "/dev/null":
+                        logger.info("[parse_diff]  Skipping deleted file")
+                        continue
+
+                    # Skip non-python
+                    if not new_path.endswith(".py"):
+                        skipped_files += 1
+                        logger.info(f"[parse_diff] ⏭ Skipping non-python: {new_path}")
+                        continue
+
+                    current_file = new_path
+                    logger.info(f"[parse_diff]  Tracking file: {current_file}")
+                    continue
+
+                # ─────────────────────────────
+                # 2. Skip metadata
+                # ─────────────────────────────
+                if (
+                    line.startswith("diff --git")
+                    or (line.startswith("--- ") and not mod_match)
+                    or line.startswith("index ")
+                    or line.startswith("@@")
+                    or line.startswith("rename ")
+                    or line.startswith("similarity ")
+                    or line.startswith("Binary files")
+                    or line.startswith("\\ No newline")
+                ):
+                    continue
+
+                # ─────────────────────────────
+                # 3. Collect content (CRITICAL FIX)
+                # ─────────────────────────────
                 if current_file is not None:
-                    self._store_file(files, current_file, current_lines)
 
-                raw_path = line[6:]  # Strip "+++ b/"
+                    if line.startswith("+") and not line.startswith("+++"):
+                        current_lines.append(line[1:])
 
-                # Skip /dev/null — means file was deleted, nothing to lint
-                if raw_path == "/dev/null":
-                    current_file = None
-                    current_lines = []
-                    continue
+                    elif line.startswith(" "):
+                        current_lines.append(line[1:])
 
-                # Only process Python files
-                if not raw_path.endswith(".py"):
-                    logger.info(
-                        f"sandbox_client: Skipping non-Python file — {raw_path}"
-                    )
-                    current_file = None
-                    current_lines = []
-                    continue
+                    elif not line.startswith("-"):
+                        #  FIX: handles simplified diffs (no prefix)
+                        current_lines.append(line)
 
-                current_file = raw_path
-                current_lines = []
-                logger.info(
-                    f"sandbox_client: Parsing file — {current_file}"
+                    # else: skip removed lines (-)
+
+            # ─────────────────────────────
+            # 4. Save last file
+            # ─────────────────────────────
+            if current_file:
+                content = "\n".join(current_lines).strip()
+
+                if content:
+                    files[current_file] = content
+                    logger.info(f"[parse_diff]  Saved final file={current_file} lines={len(current_lines)}")
+                else:
+                    logger.warning(f"[parse_diff]  Final file EMPTY: {current_file}")
+
+            # ─────────────────────────────
+            # 5. Validation + Silent Failure Detection
+            # ─────────────────────────────
+            if not files:
+                logger.error(
+                    f"[parse_diff]  NO FILES PARSED | detected={detected_files} skipped={skipped_files}"
                 )
-                continue
+                logger.debug(f"[parse_diff] Full diff dump (first 1000 chars):\n{diff[:1000]}")
+                return {}
 
-            # ── Skip diff headers — not source code ─────────────────────
-            if (
-                line.startswith("diff --git")
-                or line.startswith("index ")
-                or line.startswith("--- ")
-                or line.startswith("@@ ")
-                or line.startswith("\\ No newline")
-            ):
-                continue
+            # Detect suspicious parsing
+            for fname, content in files.items():
+                if len(content.strip()) < 20:
+                    logger.warning(f"[parse_diff]  Suspicious small file: {fname} ({len(content)} chars)")
 
-            # ── Collect source lines for the current file ────────────────
-            if current_file is None:
-                continue
+            # Debug preview of output
+            for fname, content in files.items():
+                preview = content[:120].replace("\n", "\\n")
+                logger.debug(f"[parse_diff]  {fname} preview: {preview}")
 
-            if line.startswith("+"):
-                # Added line — strip the leading "+"
-                current_lines.append(line[1:])
-
-            elif line.startswith(" "):
-                # Context line — keep exactly as-is (strip one leading space)
-                current_lines.append(line[1:])
-
-            elif line.startswith("-"):
-                # Removed line — skip (not in post-patch version)
-                continue
-
-        # Save the last file in the diff
-        if current_file is not None:
-            self._store_file(files, current_file, current_lines)
-
-        if not files:
-            raise ParseError(
-                "Diff contained no Python files to lint or test. "
-                "Only .py files are processed by the sandbox.",
-                sys,
-            )
-
-        return files
-
-    def _store_file(
-        self,
-        files: dict[str, str],
-        filename: str,
-        lines: list[str],
-    ) -> None:
-        """
-        Join collected lines into a file content string and store in files dict.
-        Skips files with no content — these are binary files or empty diffs.
-        """
-        content = "\n".join(lines)
-
-        if not content.strip():
             logger.info(
-                f"sandbox_client: Skipping empty file content — {filename}"
+                f"[parse_diff]  SUCCESS extracted={len(files)} skipped={skipped_files}"
             )
-            return
 
-        files[filename] = content
-        logger.info(
-            f"sandbox_client: Stored {len(lines)} lines for {filename}"
-        )
+            return files
+
+        except Exception as e:
+            logger.exception(f"[parse_diff]  CRASH: {str(e)}")
+            raise ParseError(f"Diff parsing failed: {str(e)}", sys)
