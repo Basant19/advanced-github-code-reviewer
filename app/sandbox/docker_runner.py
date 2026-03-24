@@ -286,46 +286,88 @@ class DockerRunner:
             return False
 
     # ── Private: Docker client ──────────────────────────────────────────────
-
     def _get_client(self) -> docker.DockerClient:
         """
-        Returns a cached Docker client. Connects on the first call.
-
-        Also verifies the sandbox image exists immediately after connecting.
-        Fail fast here rather than discovering a missing image mid-review
-        after the graph has already run analyze_code_node.
+        Robust Docker client initialization with:
+        ✔ Stale client detection
+        ✔ Retry with exponential backoff
+        ✔ Windows fallback
+        ✔ Clear observability logs
         """
+
+        MAX_RETRIES = 3
+        BASE_DELAY = 1  # seconds
+
+        # 🔁 Check cached client health
         if self._client is not None:
-            return self._client
+            try:
+                self._client.ping()
+                return self._client
+            except Exception as exc:
+                logger.warning(
+                    f"[docker_runner] Cached client stale → reconnecting | error={exc}"
+                )
+                self._client = None
 
-        try:
-            self._client = docker.from_env()
-            self._client.ping()
-            logger.info("docker_runner: Docker client connected")
-        except Exception as exc:
-            # Catches both docker.errors.DockerException (real Docker failures)
-            # and plain Exception (used in unit tests that mock docker.from_env).
-            raise SandboxError(
-                "Cannot connect to Docker daemon. "
-                "Is Docker Desktop running? "
-                f"Detail: {exc}",
-                sys,
-            ) from exc
+        last_exception = None
 
-        # Verify the sandbox image exists — fail fast with a clear fix message
-        try:
-            self._client.images.get(SANDBOX_IMAGE)
-            logger.info(f"docker_runner: Sandbox image verified — {SANDBOX_IMAGE}")
-        except docker.errors.ImageNotFound as exc:
-            raise SandboxImageNotFoundError(
-                f"Sandbox image '{SANDBOX_IMAGE}' not found. "
-                "Build it first from the project root:\n"
-                "  docker build -f docker/sandbox/Dockerfile "
-                "-t code-reviewer-sandbox:latest .",
-                sys,
-            ) from exc
+        for attempt in range(1, MAX_RETRIES + 1):
+            delay = BASE_DELAY * (2 ** (attempt - 1))  # exponential backoff
 
-        return self._client
+            try:
+                logger.info(
+                    f"[docker_runner] Connecting to Docker (attempt {attempt}/{MAX_RETRIES})"
+                )
+
+                try:
+                    client = docker.from_env(timeout=5)
+                    client.ping()
+                except Exception as e:
+                    if platform.system() == "Windows":
+                        logger.warning(
+                            "[docker_runner] Default connection failed → trying npipe fallback"
+                        )
+                        client = docker.DockerClient(
+                            base_url="npipe:////./pipe/docker_engine",
+                            timeout=5,
+                        )
+                        client.ping()
+                    else:
+                        raise e
+
+                # ✅ Verify image
+                try:
+                    client.images.get(SANDBOX_IMAGE)
+                    logger.info(
+                        f"[docker_runner] Connected & image verified: {SANDBOX_IMAGE}"
+                    )
+                except docker.errors.ImageNotFound as exc:
+                    raise SandboxImageNotFoundError(
+                        f"Sandbox image '{SANDBOX_IMAGE}' not found. Build it first.",
+                        sys,
+                    ) from exc
+
+                self._client = client
+                return client
+
+            except Exception as exc:
+                last_exception = exc
+
+                logger.error(
+                    f"[docker_runner] Attempt {attempt} failed | reason={exc}"
+                )
+
+                if attempt < MAX_RETRIES:
+                    logger.info(
+                        f"[docker_runner] Retrying in {delay}s (backoff)"
+                    )
+                    time.sleep(delay)
+
+        # 💥 Final failure
+        raise SandboxError(
+            f"Failed to connect to Docker after {MAX_RETRIES} attempts",
+            sys,
+        ) from last_exception
 
     # ── Private: Filesystem ─────────────────────────────────────────────────
 
@@ -388,110 +430,159 @@ class DockerRunner:
         run_type: RunType,
     ) -> SandboxResult:
         """
-        Spin up the sandbox container, run the command, capture output.
+        Execute sandbox container with strict timeout enforcement and full observability.
 
-        Three distinct outcomes:
-          exit code 0        → SandboxResult(passed=True)   — code is clean
-          exit code non-zero → SandboxResult(passed=False)  — ruff/pytest found issues
-          Docker error       → raises SandboxError          — infra failure
-
-        The first two are normal operation.
-        Only the third is exceptional.
+        Guarantees:
+        ✔ No hanging containers
+        ✔ Clear timeout vs infra error separation
+        ✔ Always cleans up container
+        ✔ Full lifecycle logging
         """
-        command   = self._build_command(run_type)
+
+        command = self._build_command(run_type)
         host_path = self._normalize_path(host_dir)
 
         logger.info(
-            f"docker_runner: Starting container — "
-            f"image={SANDBOX_IMAGE} run_type={run_type.value} "
-            f"host_dir={host_path} command={command}"
+            f"[docker_runner] START | image={SANDBOX_IMAGE} "
+            f"tool={run_type.value} host_dir={host_path}"
         )
 
         start_time = time.perf_counter()
+        container = None
 
         try:
-            output_bytes = client.containers.run(
+            # 🔥 Start container in detached mode (required for timeout control)
+            container = client.containers.run(
                 image=SANDBOX_IMAGE,
                 command=command,
-
-                # Mount host temp dir as /sandbox inside the container
-                volumes={
-                    host_path: {
-                        "bind": SANDBOX_WORKDIR,
-                        "mode": "rw",   # rw so ruff/pytest can write __pycache__
-                    }
-                },
+                volumes={host_path: {"bind": SANDBOX_WORKDIR, "mode": "rw"}},
                 working_dir=SANDBOX_WORKDIR,
-
-                # ── Security constraints ────────────────────────────────
-                network_disabled=True,      # No HTTP calls from reviewed code
-                cpu_quota=CPU_QUOTA,        # 0.5 cores max
+                network_disabled=True,
+                cpu_quota=CPU_QUOTA,
                 cpu_period=CPU_PERIOD,
-                mem_limit=MEMORY_LIMIT,     # 256MB RAM hard limit
-                memswap_limit=MEMORY_LIMIT, # No swap — total capped at 256MB
-
-                # ── Lifecycle ───────────────────────────────────────────
-                detach=False,   # Block until container exits
-                remove=True,    # Auto-remove container after exit
+                mem_limit=MEMORY_LIMIT,
+                memswap_limit=MEMORY_LIMIT,
+                detach=True,
                 stdout=True,
                 stderr=True,
             )
 
-            duration_ms = int((time.perf_counter() - start_time) * 1000)
-            output = (
-                output_bytes.decode("utf-8")
-                if isinstance(output_bytes, bytes)
-                else ""
+            logger.info(
+                f"[docker_runner] Container started | id={container.id[:12]}"
             )
 
-            result = SandboxResult(
-                passed=True,
-                output=output,
-                errors="",
-                exit_code=0,
-                duration_ms=duration_ms,
-                tool=run_type.value,
-            )
+            # ─────────────────────────────────────────────
+            # ⏱️ WAIT WITH HARD TIMEOUT
+            # ─────────────────────────────────────────────
+            try:
+                result = container.wait(timeout=TIMEOUT_SEC)
 
-        except docker.errors.ContainerError as exc:
-            # Container ran but ruff/pytest exited with code != 0
-            # This means code problems were found — normal operation, not infra error
-            duration_ms = int((time.perf_counter() - start_time) * 1000)
+            except Exception as exc:
+                duration_ms = int((time.perf_counter() - start_time) * 1000)
 
-            stderr_text = exc.stderr.decode("utf-8") if exc.stderr else ""
-            stdout_text = (
-                exc.stdout.decode("utf-8")
-                if hasattr(exc, "stdout") and exc.stdout
-                else ""
-            )
-            full_output = (stdout_text + "\n" + stderr_text).strip()
+                # 🔍 Distinguish timeout vs other failure
+                if "Read timed out" in str(exc) or "timeout" in str(exc).lower():
+                    logger.error(
+                        f"[docker_runner] TIMEOUT | {TIMEOUT_SEC}s exceeded "
+                        f"| container={container.id[:12]} | killing..."
+                    )
 
-            result = SandboxResult(
-                passed=False,
-                output=full_output,
-                errors=stderr_text,
-                exit_code=exc.exit_status,
-                duration_ms=duration_ms,
-                tool=run_type.value,
-            )
+                    try:
+                        container.kill()
+                        logger.info(
+                            f"[docker_runner] Container killed after timeout | id={container.id[:12]}"
+                        )
+                    except Exception as kill_exc:
+                        logger.warning(
+                            f"[docker_runner] Failed to kill container | error={kill_exc}"
+                        )
 
-        except docker.errors.APIError as exc:
-            # Docker daemon returned an unexpected API error
-            if "timeout" in str(exc).lower():
-                raise SandboxTimeoutError(
-                    f"Sandbox container exceeded {TIMEOUT_SEC}s timeout: {exc}",
+                    raise SandboxTimeoutError(
+                        f"Container exceeded timeout of {TIMEOUT_SEC}s",
+                        sys,
+                    ) from exc
+
+                # ❌ Not timeout → real infra issue
+                logger.error(
+                    f"[docker_runner] WAIT FAILED | not a timeout "
+                    f"| container={container.id[:12]} error={exc}"
+                )
+
+                raise SandboxError(
+                    f"Container wait failed: {exc}",
                     sys,
                 ) from exc
+
+            # ─────────────────────────────────────────────
+            # ✅ NORMAL COMPLETION
+            # ─────────────────────────────────────────────
+            exit_code = result.get("StatusCode", 1)
+
+            try:
+                logs = container.logs(stdout=True, stderr=True).decode("utf-8")
+            except Exception as log_exc:
+                logger.warning(
+                    f"[docker_runner] Failed to fetch logs | error={log_exc}"
+                )
+                logs = ""
+
+            duration_ms = int((time.perf_counter() - start_time) * 1000)
+
+            result_obj = SandboxResult(
+                passed=(exit_code == 0),
+                output=logs,
+                errors="",
+                exit_code=exit_code,
+                duration_ms=duration_ms,
+                tool=run_type.value,
+            )
+
+            logger.info(
+                f"[docker_runner] COMPLETE | id={container.id[:12]} "
+                f"| {result_obj.summary}"
+            )
+
+            return result_obj
+
+        # ─────────────────────────────────────────────
+        # 🔥 DOCKER API FAILURE
+        # ─────────────────────────────────────────────
+        except docker.errors.APIError as exc:
+            logger.error(
+                f"[docker_runner] DOCKER API ERROR | {exc}"
+            )
             raise SandboxError(
                 f"Docker API error during container run: {exc}",
                 sys,
             ) from exc
 
-        logger.info(
-            f"docker_runner: Container finished — {result.summary}"
-        )
+        # ─────────────────────────────────────────────
+        # 💥 UNKNOWN FAILURE (VERY IMPORTANT)
+        # ─────────────────────────────────────────────
+        except Exception as exc:
+            logger.exception(
+                f"[docker_runner] UNEXPECTED ERROR | {exc}"
+            )
+            raise SandboxError(
+                f"Unexpected sandbox failure: {exc}",
+                sys,
+            ) from exc
 
-        return result
+        # ─────────────────────────────────────────────
+        # 🧹 CLEANUP (ALWAYS RUNS)
+        # ─────────────────────────────────────────────
+        finally:
+            if container:
+                try:
+                    container.remove(force=True)
+                    logger.info(
+                        f"[docker_runner] CLEANUP | container removed id={container.id[:12]}"
+                    )
+                except Exception as cleanup_exc:
+                    logger.warning(
+                        f"[docker_runner] CLEANUP FAILED | id={container.id[:12]} "
+                        f"| error={cleanup_exc}"
+                    )
 
     # ── Private: Helpers ────────────────────────────────────────────────────
 
@@ -543,3 +634,4 @@ class DockerRunner:
             return normalized
 
         return str(path.resolve())
+    
