@@ -1,4 +1,5 @@
 """
+E:\advanced-github-code-reviewer\app\db\models\thread.py
 Thread Model
 
 This module defines the SQLAlchemy ORM model responsible for
@@ -91,11 +92,16 @@ class Thread(Base):
             primary_key=True,
             index=True
         )
+        thread_id = Column(String(255), 
+                           unique=True, 
+                           index=True
+                           , nullable=False)
 
         title = Column(
             String(255),
             nullable=False
         )
+
 
         pull_request_id = Column(
             Integer,

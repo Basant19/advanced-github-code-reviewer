@@ -187,6 +187,16 @@ try:
     logger.info("Chat schemas loaded successfully")
 
 
+    class StreamChunk(BaseModel):
+            """
+            Schema for streaming chat responses.
+            """
+            content: str = Field(..., description="Partial message content")
+            is_complete: bool = Field(False, description="Whether the stream is finished")
+            error: bool = Field(False, description="Whether an error occurred")
+
+
 except Exception as e:
     logger.error("Error while defining chat schemas")
     raise CustomException(e, sys)
+
