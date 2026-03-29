@@ -15,6 +15,7 @@ Node execution order (defined in workflow.py):
         → refactor_node              — Gemini corrective patch (conditional)
         → validator_node             — ruff + pytest in Docker (conditional)
         → memory_write_node      ★ P4 — write findings to ChromaDB memory
+        → summary_node               — format HITL briefing markdown
         → hitl_node              [interrupt_before pauses here]
         → verdict_node
         → END
@@ -34,26 +35,41 @@ LLM Failure Signals
 FREE_TIER_EXHAUSTED  — 429 quota error from Google API
 LLM_ERROR            — any other LLM failure (timeout, server error)
 
-When these signals are returned by safe_llm_invoke():
-    - The node continues with degraded output (empty issues / skipped step)
-    - The graph does NOT crash
-    - The HITL gate still fires — human can review degraded output
-    - verdict_node produces a clear summary of what happened
+Patch Sanitization (Critical)
+------------------------------
+Gemini hallucinates in two distinct ways when generating patches:
+
+Mode 1 — Outer fences (handled by _sanitize_patch outer fence stripper):
+```diff
+    --- a/file.py
+    +++ b/file.py
+    ...
+```
+
+Mode 2 — Inline contamination (the real problem, handled by _deep_clean_patch):
+    Gemini embeds backtick sequences INSIDE the + lines of the diff:
+        +b = str(b)`.
+        +```
+        +some code
+    This makes the reconstructed file contain backticks that Python can't parse,
+    causing ruff/pytest to find SyntaxErrors even in "fixed" code.
+
+_sanitize_patch() handles Mode 1.
+_deep_clean_patch() handles Mode 2 — scans every + line and removes backtick
+sequences, trailing backticks, and standalone fence lines that appear inside
+the diff content. Both are applied in sequence in refactor_node.
 
 ChromaDB / RAG (P4)
 -------------------
 retrieve_context_node queries ChromaDB with the PR diff as the search query.
 grade_context_node asks Gemini to grade whether the retrieved context is
-relevant to the current PR. If grade is "yes", context is passed to
-analyze_code_node. If "no", an empty context is used instead (CRAG pattern).
-memory_write_node writes the review findings (issues + verdict) to ChromaDB
-after the review completes so future reviews on the same repo are context-aware.
+relevant to the current PR (CRAG pattern).
+memory_write_node writes the review findings to ChromaDB after the review.
 
 Embedding Model
 ---------------
-gemini-embedding-001 is used for ChromaDB embeddings.
-This model is confirmed available on the project API key.
-ChromaDB collection is initialized lazily — returns None on any failure.
+gemini-embedding-001 — confirmed available on the project API key.
+ChromaDB collection initialized lazily — returns None on any failure.
 All nodes that use ChromaDB check for None before calling.
 
 Async Safety
@@ -69,15 +85,14 @@ Patching in Tests
 
     with patch.object(nodes, "sandbox_client", mock_sc):
         ...
-
     with patch.object(nodes, "_llm_instance", mock_llm):
         ...
-
     with patch.object(nodes, "_chroma_collection", mock_collection):
         ...
 """
 
 import os
+import re
 import sys
 import time
 import uuid
@@ -100,85 +115,32 @@ logger = get_logger(__name__)
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 LLM_TIMEOUT: int = 30
-"""Hard ceiling (seconds) for a single Gemini API call."""
-
 LLM_SEMAPHORE: asyncio.Semaphore = asyncio.Semaphore(1)
-"""
-Limits concurrent LLM calls to 1 on the free tier.
-Prevents RPM burst errors when multiple requests arrive simultaneously.
-Increase to 2 when billing is enabled.
-"""
-
 MAX_DIFF_CHARS: int = 4000
-"""Maximum diff characters sent to Gemini — keeps prompt within token limits."""
-
 MAX_CONTEXT_CHARS: int = 2000
-"""Maximum repo context characters injected into the analysis prompt."""
-
 FREE_TIER_EXHAUSTED: str = "FREE_TIER_EXHAUSTED"
-"""Sentinel returned by safe_llm_invoke() on 429 quota error."""
-
 LLM_ERROR: str = "LLM_ERROR"
-"""Sentinel returned by safe_llm_invoke() on timeout or unexpected failure."""
-
 CONTEXT_GRADE_YES: str = "yes"
-"""Grade returned by grade_context_node when retrieved context is relevant."""
-
 CONTEXT_GRADE_NO: str = "no"
-"""Grade returned by grade_context_node when retrieved context is not relevant."""
 
 
-# ── Module-level lazy singletons (patchable in tests) ────────────────────────
+# ── Module-level lazy singletons ──────────────────────────────────────────────
 
 _llm_instance: Optional[ChatGoogleGenerativeAI] = None
-"""
-Lazily initialized Gemini chat model instance.
-Access via get_llm() — never reference this directly outside get_llm().
-Module-level so patch.object(nodes, '_llm_instance', mock) works in tests.
-"""
-
 sandbox_client = None
-"""
-Lazily initialized SandboxClient.
-Module-level so patch.object(nodes, 'sandbox_client', mock_sc) works in tests.
-"""
-
 _chroma_collection = None
-"""
-Lazily initialized ChromaDB collection.
-Module-level so patch.object(nodes, '_chroma_collection', mock) works in tests.
-Set to None if ChromaDB init fails — all RAG nodes check for None gracefully.
-"""
-
 _chroma_embedder: Optional[GoogleGenerativeAIEmbeddings] = None
-"""
-Lazily initialized Gemini embedding model for ChromaDB queries.
-Uses gemini-embedding-001 — confirmed available on the project API key.
-"""
 
 
 # ── Burst Tracking ────────────────────────────────────────────────────────────
 
 _LLM_CALL_HISTORY: deque = deque(maxlen=100)
-"""Sliding window of LLM call timestamps for burst detection logging."""
 
 
 def _record_llm_call() -> int:
-    """
-    Record an LLM call timestamp and return the burst count in the last 10s.
-
-    Used only for observability logging — does not throttle calls.
-    The semaphore handles actual concurrency limiting.
-
-    Returns
-    -------
-    int
-        Number of LLM calls recorded in the last 10 seconds.
-    """
     now = time.time()
     _LLM_CALL_HISTORY.append(now)
-    window_seconds = 10
-    return sum(1 for t in _LLM_CALL_HISTORY if now - t <= window_seconds)
+    return sum(1 for t in _LLM_CALL_HISTORY if now - t <= 10)
 
 
 # ── LLM Initialization ────────────────────────────────────────────────────────
@@ -187,26 +149,9 @@ def get_llm() -> ChatGoogleGenerativeAI:
     """
     Return the module-level Gemini chat model, initializing on first call.
 
-    Configuration
-    -------------
-    model        : gemini-2.5-flash-lite — confirmed working on project API key
-    temperature  : 0                     — deterministic output for code review
-    max_retries  : 0                     — CRITICAL: prevents internal SDK retry
-                                           storms that silently exhaust free quota.
-                                           safe_llm_invoke() handles retry logic.
-
-    The module-level singleton pattern ensures the model is only initialized
-    once per process lifetime, avoiding repeated API key validation overhead.
-
-    Returns
-    -------
-    ChatGoogleGenerativeAI
-        Initialized Gemini chat model instance.
-
-    Raises
-    ------
-    CustomException
-        If GOOGLE_API_KEY is not set in environment.
+    model        : gemini-2.5-flash-lite
+    temperature  : 0    — deterministic output
+    max_retries  : 0    — prevents SDK retry storms on free tier
     """
     global _llm_instance
 
@@ -216,8 +161,7 @@ def get_llm() -> ChatGoogleGenerativeAI:
     api_key = os.environ.get("GOOGLE_API_KEY")
     if not api_key:
         logger.error(
-            "[nodes] get_llm: GOOGLE_API_KEY not found in environment — "
-            "check that app/core/config.py loaded .env correctly"
+            "[nodes] get_llm: GOOGLE_API_KEY not found in environment"
         )
         raise CustomException("GOOGLE_API_KEY is not set in environment", sys)
 
@@ -239,19 +183,7 @@ def get_llm() -> ChatGoogleGenerativeAI:
 # ── Sandbox Initialization ────────────────────────────────────────────────────
 
 def get_sandbox():
-    """
-    Return the module-level SandboxClient, initializing on first call.
-
-    Safe to call when Docker Desktop is not running — SandboxClient.__init__
-    does not connect to Docker. Connection only happens inside run_lint()
-    and run_tests() when they are actually invoked.
-
-    Returns
-    -------
-    SandboxClient or None
-        None if Docker SDK is not available or initialization fails.
-        Callers must check for None before using.
-    """
+    """Return the module-level SandboxClient, initializing on first call."""
     global sandbox_client
 
     if sandbox_client is not None:
@@ -277,27 +209,8 @@ def get_chroma_collection() -> Tuple[Optional[Any], Optional[GoogleGenerativeAIE
     """
     Return the module-level ChromaDB collection and embedder, initializing lazily.
 
-    Embedding Model
-    ---------------
     Uses gemini-embedding-001 — confirmed available on the project API key.
-    Do NOT use text-embedding-004 (not available on this key).
-    Do NOT use gemini-embedding-2-preview (preview, unstable for production).
-
-    ChromaDB Path
-    -------------
-    Persistent client at ./chroma_store — created on first call.
-    Collection name: "repo_context"
-    This collection is empty until the P4 indexing pipeline populates it.
-
-    Returns
-    -------
-    Tuple[Optional[collection], Optional[embedder]]
-        (collection, embedder) on success.
-        (None, None) on any failure — all callers handle this gracefully.
-
-    Notes
-    -----
-    Module-level so patch.object(nodes, '_chroma_collection', mock) works in tests.
+    Returns (None, None) on any failure — all callers handle this gracefully.
     """
     global _chroma_collection, _chroma_embedder
 
@@ -328,7 +241,6 @@ def get_chroma_collection() -> Tuple[Optional[Any], Optional[GoogleGenerativeAIE
         )
 
         client = chromadb.PersistentClient(path="./chroma_store")
-
         _chroma_collection = client.get_or_create_collection(
             name="repo_context",
             metadata={"hnsw:space": "cosine"},
@@ -345,8 +257,7 @@ def get_chroma_collection() -> Tuple[Optional[Any], Optional[GoogleGenerativeAIE
     except Exception as e:
         logger.warning(
             "[nodes] get_chroma_collection: ChromaDB init failed — "
-            "RAG nodes will be skipped. error=%s",
-            str(e),
+            "RAG nodes will be skipped. error=%s", str(e),
         )
         return None, None
 
@@ -355,31 +266,20 @@ def get_chroma_collection() -> Tuple[Optional[Any], Optional[GoogleGenerativeAIE
 
 async def safe_llm_invoke(messages: List[Any]) -> str:
     """
-    Invoke Gemini with quota protection, timeout, and burst prevention.
-
-    This is the SINGLE call site for all LLM invocations in the graph.
-    It guarantees:
-        - Graph never crashes on LLM failure
-        - Free-tier quota errors are detected instantly (no retry storm)
-        - Hard 30s timeout prevents runaway async tasks
-        - Concurrent calls bounded by LLM_SEMAPHORE (1 on free tier)
-        - 2-second cooldown after success prevents RPM burst
-
-    Parameters
-    ----------
-    messages : List[Any]
-        LangChain message list (SystemMessage + HumanMessage).
-
-    Returns
-    -------
-    str
-        One of:
-        - Normal LLM response content string
-        - FREE_TIER_EXHAUSTED  (on 429 quota error — after 60s wait)
-        - LLM_ERROR            (on timeout or unexpected failure)
+    Invoke Gemini with strict RPM protection (15 RPM limit).
+    
+    Protections:
+    1. Semaphore(1): Prevents concurrent LLM calls.
+    2. 5s Cooldown: Ensures throughput stays ~12 RPM (below 15 limit).
+    3. 70s Penalty: Resets the quota window if a 429 occurs.
+    4. CustomException: Raised for critical configuration/logic errors.
     """
     call_id = str(uuid.uuid4())[:8]
     start_time = time.time()
+
+    if not messages:
+        logger.error(f"[LLM][{call_id}] Empty messages provided")
+        raise CustomException("Cannot invoke LLM with empty message list.")
 
     logger.info(
         "[LLM][%s] REQUEST_START | queued_for_semaphore | msg_count=%d",
@@ -390,80 +290,317 @@ async def safe_llm_invoke(messages: List[Any]) -> str:
 
     async with LLM_SEMAPHORE:
         queue_wait = time.time() - queue_start
-        burst_count = _record_llm_call()
-
+        
         logger.info(
-            "[LLM][%s] ACQUIRED | queue_wait=%.2fs | "
-            "concurrent_limit=%d | burst_last_10s=%d",
-            call_id,
-            queue_wait,
-            LLM_SEMAPHORE._value,
-            burst_count,
+            "[LLM][%s] ACQUIRED | queue_wait=%.2fs | RPM_limit=15",
+            call_id, queue_wait,
         )
 
         try:
             llm = get_llm()
+            if not llm:
+                raise CustomException("LLM client could not be initialized.")
+
             invoke_start = time.time()
 
-            logger.info(
-                "[LLM][%s] INVOKE_START | timeout=%ds",
-                call_id, LLM_TIMEOUT,
-            )
-
+            # Execute the call
             response = await asyncio.wait_for(
                 llm.ainvoke(messages),
                 timeout=LLM_TIMEOUT,
             )
 
             invoke_time = time.time() - invoke_start
-            total_time = time.time() - start_time
-
+            
+            # --- RPM PROTECTION LOGIC ---
+            # 60s / 15 RPM = 4s minimum. We use 5s to be safe.
+            cooldown_seconds = 5 
+            
             logger.info(
-                "[LLM][%s] SUCCESS | invoke_time=%.2fs | total_time=%.2fs",
-                call_id, invoke_time, total_time,
+                "[LLM][%s] SUCCESS | invoke_time=%.2fs | cooling down %ds",
+                call_id, invoke_time, cooldown_seconds,
             )
-
-            # Cooldown prevents back-to-back RPM burst
-            cooldown_seconds = 2
-            logger.info(
-                "[LLM][%s] COOLDOWN | sleeping=%ds to prevent RPM burst",
-                call_id, cooldown_seconds,
-            )
+            
+            # This sleep inside the semaphore block ensures the NEXT node 
+            # cannot acquire the semaphore until this cooldown expires.
             await asyncio.sleep(cooldown_seconds)
 
             return response.content
 
         except asyncio.TimeoutError:
-            total_time = time.time() - start_time
-            logger.error(
-                "[LLM][%s] TIMEOUT | exceeded=%ds | total_time=%.2fs — "
-                "returning LLM_ERROR",
-                call_id, LLM_TIMEOUT, total_time,
-            )
+            logger.error("[LLM][%s] TIMEOUT | exceeded %ds", call_id, LLM_TIMEOUT)
             return LLM_ERROR
 
         except Exception as e:
-            total_time = time.time() - start_time
             error_str = str(e)
+            total_time = time.time() - start_time
 
+            # Handle Rate Limiting (429)
             if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-                logger.error(
-                    "[LLM][%s] RATE_LIMIT | 429 hit | total_time=%.2fs | "
-                    "sleeping=60s before returning FREE_TIER_EXHAUSTED",
-                    call_id, total_time,
+                penalty_sleep = 70
+                logger.warning(
+                    "[LLM][%s] RATE_LIMIT (429) | Penalty sleep %ds | total_time=%.2fs",
+                    call_id, penalty_sleep, total_time
                 )
-                await asyncio.sleep(60)
+                # Sleep long enough to clear the 60s window
+                await asyncio.sleep(penalty_sleep)
                 return FREE_TIER_EXHAUSTED
 
+            # Handle unexpected API/Network errors
             logger.exception(
-                "[LLM][%s] FAILURE | total_time=%.2fs | error=%s — "
-                "returning LLM_ERROR",
-                call_id, total_time, error_str,
+                "[LLM][%s] FAILURE | error=%s",
+                call_id, error_str
             )
             return LLM_ERROR
 
         finally:
-            logger.info("[LLM][%s] REQUEST_END", call_id)
+            logger.info("[LLM][%s] REQUEST_RELEASED", call_id)
+
+
+# ── Patch Sanitizers ──────────────────────────────────────────────────────────
+
+def _sanitize_patch(raw: str) -> str:
+    """
+    Strip outer markdown code fences from an LLM-generated patch.
+
+    Handles Mode 1 hallucination: Gemini wraps the entire diff in fences.
+
+    Expected input with fences:
+```diff
+        --- a/calculator.py
+        +++ b/calculator.py
+        @@ -1,3 +1,3 @@
+        -b = str(b).
+        +b = str(b)
+```
+
+    Returns the raw diff content without the opening/closing fence lines.
+    If no fences are found, returns the original string stripped of whitespace.
+
+    Parameters
+    ----------
+    raw : str
+        Raw string from Gemini — may or may not contain outer fences.
+
+    Returns
+    -------
+    str
+        Diff text with outer markdown fences removed.
+    """
+    if not raw:
+        return raw
+
+    # Match opening fence: ```diff, ```python, ```patch, ```text, ```py, or plain ```
+    fence_pattern = re.compile(
+        r"^```(?:diff|python|patch|text|py)?\s*\n",
+        re.MULTILINE | re.IGNORECASE,
+    )
+
+    match = fence_pattern.search(raw)
+    if not match:
+        return raw.strip()
+
+    content_after_fence = raw[match.end():]
+
+    # Remove the closing fence (last ``` in the string)
+    closing_fence = re.compile(r"\n```\s*$", re.MULTILINE)
+    cleaned = closing_fence.sub("", content_after_fence)
+
+    result = cleaned.strip()
+
+    if result != raw.strip():
+        logger.info(
+            "[_sanitize_patch] Stripped outer fences — "
+            "original_chars=%d cleaned_chars=%d",
+            len(raw), len(result),
+        )
+
+    return result
+
+
+def _deep_clean_patch(patch: str) -> str:
+    """
+    Remove inline backtick contamination from patch + lines and content lines.
+
+    Handles Mode 2 hallucination: Gemini embeds backtick characters INSIDE
+    the code content of the diff. This produces files that Python cannot parse.
+
+    Examples of inline contamination caught here:
+
+        +b = str(b)`.          ← trailing backtick after valid code
+        +```                   ← standalone fence line inside diff
+        +b = str(b)`           ← backtick glued to end of identifier
+        +```python             ← language-annotated fence inside diff
+        +x = 1 ` + "`" + `    ← multi-backtick pattern (rare)
+
+    Cleaning Rules
+    --------------
+    For lines starting with + or space (context lines — lines kept in output):
+        1. If the line is ONLY backticks (e.g. "```", "```diff") → drop it
+        2. If the line ends with backtick(s) after code → strip trailing backtick(s)
+        3. If the line contains isolated inline backtick sequences → strip them
+
+    Lines starting with - (removed lines) are passed through unchanged —
+    they are not part of the output file content so contamination there
+    does not affect parsing.
+
+    Lines starting with @@ (hunk headers) are passed through unchanged.
+
+    Parameters
+    ----------
+    patch : str
+        The patch string after _sanitize_patch() has been applied.
+        May contain inline backtick contamination in + or context lines.
+
+    Returns
+    -------
+    str
+        Patch with all inline backtick contamination removed from content lines.
+
+    Notes
+    -----
+    This function is intentionally conservative — it only removes backtick
+    characters and never modifies the actual Python code logic on a line.
+    If a line becomes empty after stripping, it is kept as an empty line
+    rather than being dropped, to preserve diff hunk line counts.
+    """
+    if not patch:
+        return patch
+
+    raw_patch = patch  # alias for clarity in logging
+
+    cleaned_lines = []
+    removed_lines = 0
+    modified_lines = 0
+
+    # Pattern: a line that is ONLY a markdown fence (optional language tag)
+    standalone_fence = re.compile(
+        r"^[+ ]?```(?:diff|python|patch|text|py)?\s*$",
+        re.IGNORECASE,
+    )
+
+    # Pattern: trailing backtick(s) at end of a code line
+    # Matches ` or `` or ``` at the very end, optionally preceded by a period or space
+    trailing_backtick = re.compile(r"[`]+\s*$")
+
+    # Pattern: inline backtick sequence embedded mid-line
+    # e.g. str(b)`. or str(b)`
+    inline_backtick = re.compile(r"`+")
+
+    for line in raw_patch.splitlines():
+        # ── Pass through unchanged: removed lines and hunk headers ───────────
+        if line.startswith("-") or line.startswith("@@") or line.startswith("diff") or line.startswith("index"):
+            cleaned_lines.append(line)
+            continue
+
+        # ── Content lines: + lines and context (space) lines ─────────────────
+        # Determine the prefix character and actual code content
+        if line.startswith("+") and not line.startswith("+++"):
+            prefix = "+"
+            code = line[1:]
+        elif line.startswith(" "):
+            prefix = " "
+            code = line[1:]
+        else:
+            # Header lines (---, +++, etc.) — pass through unchanged
+            cleaned_lines.append(line)
+            continue
+
+        # ── Rule 1: Drop standalone fence lines ───────────────────────────────
+        if standalone_fence.match(line):
+            removed_lines += 1
+            logger.debug(
+                "[_deep_clean_patch] Dropped standalone fence line: %r",
+                line[:80],
+            )
+            continue
+
+        # ── Rule 2: Strip trailing backtick(s) ───────────────────────────────
+        if trailing_backtick.search(code):
+            original_code = code
+            code = trailing_backtick.sub("", code).rstrip()
+            if code != original_code:
+                modified_lines += 1
+                logger.debug(
+                    "[_deep_clean_patch] Stripped trailing backtick: %r → %r",
+                    original_code[:60], code[:60],
+                )
+
+        # ── Rule 3: Strip remaining inline backtick sequences ─────────────────
+        # Only apply if backticks remain after Rule 2
+        if "`" in code:
+            original_code = code
+            code = inline_backtick.sub("", code)
+            if code != original_code:
+                modified_lines += 1
+                logger.debug(
+                    "[_deep_clean_patch] Stripped inline backtick: %r → %r",
+                    original_code[:60], code[:60],
+                )
+
+        cleaned_lines.append(prefix + code)
+
+    result = "\n".join(cleaned_lines)
+
+    if removed_lines > 0 or modified_lines > 0:
+        logger.info(
+            "[_deep_clean_patch] Cleaned patch — "
+            "removed_lines=%d modified_lines=%d "
+            "original_chars=%d cleaned_chars=%d",
+            removed_lines, modified_lines,
+            len(raw_patch), len(result),
+        )
+
+    return result
+
+
+def _validate_patch_syntax(patch: str) -> Tuple[bool, str]:
+    """
+    Quick heuristic check that a patch looks like a valid unified diff.
+
+    Checks for the minimum structural requirements:
+        - Contains at least one +++ header line
+        - Contains at least one + content line
+        - Does NOT contain unescaped backtick sequences in + lines
+        - Does NOT contain standalone ``` lines
+
+    This is NOT a full diff validator — just a sanity check to catch
+    obviously broken patches before sending to Docker.
+
+    Parameters
+    ----------
+    patch : str
+        Cleaned patch string after _sanitize_patch + _deep_clean_patch.
+
+    Returns
+    -------
+    Tuple[bool, str]
+        (is_valid, reason)
+        is_valid=True if patch passes all heuristic checks.
+        reason="" on success, or a description of the failure.
+    """
+    if not patch or not patch.strip():
+        return False, "patch is empty"
+
+    lines = patch.splitlines()
+
+    has_plus_header = any(l.startswith("+++") for l in lines)
+    has_plus_content = any(l.startswith("+") and not l.startswith("+++") for l in lines)
+
+    if not has_plus_header:
+        return False, "patch has no +++ header line — not a valid unified diff"
+
+    if not has_plus_content:
+        return False, "patch has no + content lines — nothing to apply"
+
+    # Check for surviving backtick contamination
+    for line in lines:
+        if line.startswith("+") and not line.startswith("+++"):
+            if "`" in line:
+                return False, f"patch still contains backtick on line: {line[:60]!r}"
+            if line.strip() in ("```", "```diff", "```python", "```patch"):
+                return False, f"patch still contains fence line: {line[:60]!r}"
+
+    return True, ""
 
 
 # ── Output Parser ─────────────────────────────────────────────────────────────
@@ -472,25 +609,14 @@ def _parse_llm_output(raw: str) -> Tuple[List[str], List[str]]:
     """
     Parse structured ISSUES / SUGGESTIONS sections from LLM response.
 
-    Expected LLM response format:
+    Expected format:
         ISSUES:
         - issue one
-        - issue two
 
         SUGGESTIONS:
         - suggestion one
 
-    Handles case-insensitive section headers and skips "- None" lines.
-
-    Parameters
-    ----------
-    raw : str
-        Raw string content from LLM response.
-
-    Returns
-    -------
-    Tuple[List[str], List[str]]
-        (issues, suggestions) — both may be empty lists if none found.
+    Returns (issues, suggestions) — both may be empty lists.
     """
     issues: List[str] = []
     suggestions: List[str] = []
@@ -516,7 +642,7 @@ def _parse_llm_output(raw: str) -> Tuple[List[str], List[str]]:
     return issues, suggestions
 
 
-# ── Helper: Python file detection ─────────────────────────────────────────────
+# ── Helper ────────────────────────────────────────────────────────────────────
 
 def _has_python_files(files: list) -> bool:
     """Return True if any changed file in the PR ends with .py."""
@@ -527,7 +653,7 @@ def _has_python_files(files: list) -> bool:
 
 
 # =============================================================================
-# NODES — P1/P2 (unchanged)
+# NODES
 # =============================================================================
 
 @traceable(name="fetch_diff_node", tags=["github", "fetch"])
@@ -538,12 +664,6 @@ async def fetch_diff_node(state: ReviewState) -> Dict:
     Reads  : state["owner"], state["repo"], state["pr_number"]
     Writes : state["metadata"], state["files"], state["diff"]
              state["error"], state["error_reason"] (on failure)
-
-    Failure Behaviour
-    -----------------
-    On GitHub API failure, sets error=True and error_reason="github_fetch_failed".
-    check_error() in workflow.py routes directly to hitl_node on error.
-    Human can inspect the partial state and decide what to do.
     """
     owner = state["owner"]
     repo = state["repo"]
@@ -567,50 +687,31 @@ async def fetch_diff_node(state: ReviewState) -> Dict:
 
         return {
             "metadata": metadata,
-            "files": files,
-            "diff": diff,
-            "error": False,
+            "files":    files,
+            "diff":     diff,
+            "error":    False,
         }
 
     except Exception as e:
         logger.exception(
-            "[fetch_diff_node] GitHub fetch failed — "
-            "setting error=True | error=%s", str(e),
+            "[fetch_diff_node] GitHub fetch failed — error=%s", str(e),
         )
         return {
-            "error": True,
+            "error":        True,
             "error_reason": "github_fetch_failed",
         }
 
-
-# =============================================================================
-# NODES — P4 NEW
-# =============================================================================
 
 @traceable(name="retrieve_context_node", tags=["chromadb", "rag", "p4"])
 async def retrieve_context_node(state: ReviewState) -> Dict:
     """
     Query ChromaDB for relevant codebase context for the current PR.
 
-    Uses the PR diff as the search query to find semantically similar
-    code chunks previously indexed from the same repository. Retrieved
-    context is passed to grade_context_node for relevance grading before
-    being injected into analyze_code_node.
-
     Reads  : state["diff"], state["metadata"], state["error"]
-    Writes : state["raw_context"]  — raw retrieved docs (ungraded)
+    Writes : state["raw_context"]
 
-    P4 Notes
-    --------
-    ChromaDB is empty until the indexing pipeline (POST /repos/index) runs.
-    If collection is empty or unavailable, raw_context is set to "" and
-    the graph continues without context — this is the expected behavior
-    before any repo has been indexed.
-
-    Failure Behaviour
-    -----------------
-    Any ChromaDB failure sets raw_context="" and continues.
-    The graph NEVER crashes on RAG failures — context is optional.
+    Returns raw_context="" if ChromaDB is empty, unavailable, or query fails.
+    Graph NEVER crashes on RAG failures — context is optional.
     """
     if state.get("error"):
         logger.warning(
@@ -634,21 +735,18 @@ async def retrieve_context_node(state: ReviewState) -> Dict:
 
     if not collection or not embedder:
         logger.info(
-            "[retrieve_context_node] ChromaDB unavailable — "
-            "skipping retrieval, raw_context=''"
+            "[retrieve_context_node] ChromaDB unavailable — skipping retrieval"
         )
         return {"raw_context": ""}
 
     if collection.count() == 0:
         logger.info(
             "[retrieve_context_node] ChromaDB collection is empty — "
-            "no context available yet. "
-            "Run POST /repos/index to index the repository first."
+            "run POST /repos/index first"
         )
         return {"raw_context": ""}
 
     try:
-        # Use diff + PR title as search query for best semantic match
         query_text = f"{pr_title}\n{diff[:1000]}"
 
         logger.info(
@@ -658,7 +756,6 @@ async def retrieve_context_node(state: ReviewState) -> Dict:
         )
 
         query_embedding = embedder.embed_query(query_text)
-
         results = collection.query(
             query_embeddings=[query_embedding],
             n_results=min(3, collection.count()),
@@ -670,12 +767,9 @@ async def retrieve_context_node(state: ReviewState) -> Dict:
         distances = results.get("distances", [[]])[0]
 
         if not docs:
-            logger.info(
-                "[retrieve_context_node] No results returned from ChromaDB"
-            )
+            logger.info("[retrieve_context_node] No results from ChromaDB")
             return {"raw_context": ""}
 
-        # Format retrieved context with source metadata
         context_parts = []
         for doc, meta, dist in zip(docs, metadatas, distances):
             source = meta.get("source", "unknown")
@@ -686,8 +780,7 @@ async def retrieve_context_node(state: ReviewState) -> Dict:
         raw_context = "\n\n".join(context_parts)
 
         logger.info(
-            "[retrieve_context_node] Retrieved %d chunk(s) — "
-            "total_chars=%d",
+            "[retrieve_context_node] Retrieved %d chunk(s) — total_chars=%d",
             len(docs), len(raw_context),
         )
 
@@ -696,8 +789,7 @@ async def retrieve_context_node(state: ReviewState) -> Dict:
     except Exception as e:
         logger.warning(
             "[retrieve_context_node] ChromaDB query failed — "
-            "continuing without context. error=%s",
-            str(e),
+            "continuing without context. error=%s", str(e),
         )
         return {"raw_context": ""}
 
@@ -705,27 +797,14 @@ async def retrieve_context_node(state: ReviewState) -> Dict:
 @traceable(name="grade_context_node", tags=["llm", "rag", "crag", "p4"])
 async def grade_context_node(state: ReviewState) -> Dict:
     """
-    Grade the relevance of retrieved ChromaDB context for the current PR.
+    Grade the relevance of retrieved ChromaDB context (CRAG pattern).
 
-    Implements the Corrective RAG (CRAG) pattern — ask Gemini whether
-    the retrieved context is actually relevant to the PR diff before
-    injecting it into the analysis prompt. This prevents irrelevant
-    context from confusing the analyzer.
-
-    If the grade is "yes":  repo_context = raw_context (passed to analyzer)
-    If the grade is "no":   repo_context = ""          (no context injected)
-    If LLM fails:           repo_context = raw_context (fail open — use context)
+    If grade is "yes" → repo_context = raw_context (injected into analyzer)
+    If grade is "no"  → repo_context = "" (irrelevant context discarded)
+    If LLM fails      → fails open (raw_context passed through unchanged)
 
     Reads  : state["raw_context"], state["diff"], state["error"]
-    Writes : state["repo_context"]  — graded context (empty if irrelevant)
-             state["context_grade"] — "yes" | "no" | "skipped"
-
-    Failure Behaviour
-    -----------------
-    On LLM failure, fails OPEN — passes raw_context through unchanged.
-    This is intentional: better to include potentially irrelevant context
-    than to drop relevant context due to a grading LLM failure.
-    The HITL gate still fires so a human can review the output.
+    Writes : state["repo_context"], state["context_grade"]
     """
     if state.get("error"):
         logger.warning(
@@ -737,11 +816,9 @@ async def grade_context_node(state: ReviewState) -> Dict:
     raw_context = state.get("raw_context", "")
     diff = state.get("diff", "")
 
-    # No context to grade — skip LLM call
     if not raw_context:
         logger.info(
-            "[grade_context_node] No raw_context to grade — "
-            "skipping LLM call, repo_context=''"
+            "[grade_context_node] No raw_context to grade — skipping LLM call"
         )
         return {"repo_context": "", "context_grade": "skipped"}
 
@@ -754,8 +831,7 @@ async def grade_context_node(state: ReviewState) -> Dict:
     prompt = [
         SystemMessage(content=(
             "You are a relevance grader for a code review system.\n\n"
-            "Your job is to determine if retrieved codebase context is "
-            "relevant to a given PR diff.\n\n"
+            "Determine if retrieved codebase context is relevant to a PR diff.\n\n"
             "Respond with ONLY one word: 'yes' or 'no'.\n"
             "- 'yes' if the context contains code, patterns, or conventions "
             "that would help review the PR diff.\n"
@@ -764,58 +840,48 @@ async def grade_context_node(state: ReviewState) -> Dict:
         HumanMessage(content=(
             f"--- Retrieved Context ---\n{raw_context[:1000]}\n\n"
             f"--- PR Diff ---\n{diff[:1000]}\n\n"
-            "Is this context relevant to reviewing this PR diff? "
-            "Respond with ONLY 'yes' or 'no'."
+            "Is this context relevant? Respond with ONLY 'yes' or 'no'."
         )),
     ]
 
     result = await safe_llm_invoke(prompt)
 
-    # Handle LLM failures — fail open (use context)
     if result in (FREE_TIER_EXHAUSTED, LLM_ERROR):
         logger.warning(
             "[grade_context_node] LLM unavailable (%s) — "
-            "failing open, passing raw_context through",
-            result,
+            "failing open, passing raw_context through", result,
         )
         return {
-            "repo_context": raw_context[:MAX_CONTEXT_CHARS],
+            "repo_context":  raw_context[:MAX_CONTEXT_CHARS],
             "context_grade": "skipped",
         }
 
     grade = result.strip().lower()
 
-    # Normalize to yes/no — LLM sometimes adds punctuation
     if "yes" in grade:
         grade = CONTEXT_GRADE_YES
     elif "no" in grade:
         grade = CONTEXT_GRADE_NO
     else:
         logger.warning(
-            "[grade_context_node] Unexpected grade response: '%s' — "
-            "defaulting to 'yes' (fail open)",
+            "[grade_context_node] Unexpected grade: '%s' — defaulting to yes",
             result.strip(),
         )
         grade = CONTEXT_GRADE_YES
 
     if grade == CONTEXT_GRADE_YES:
         logger.info(
-            "[grade_context_node] Grade=YES — "
-            "context is relevant, injecting into analyzer "
-            "context_chars=%d",
+            "[grade_context_node] Grade=YES — injecting context_chars=%d",
             min(len(raw_context), MAX_CONTEXT_CHARS),
         )
         return {
-            "repo_context": raw_context[:MAX_CONTEXT_CHARS],
+            "repo_context":  raw_context[:MAX_CONTEXT_CHARS],
             "context_grade": grade,
         }
     else:
-        logger.info(
-            "[grade_context_node] Grade=NO — "
-            "context not relevant, discarding"
-        )
+        logger.info("[grade_context_node] Grade=NO — discarding context")
         return {
-            "repo_context": "",
+            "repo_context":  "",
             "context_grade": grade,
         }
 
@@ -825,20 +891,10 @@ async def analyze_code_node(state: ReviewState) -> Dict:
     """
     Use Gemini to analyze the PR diff and identify issues and suggestions.
 
-    P4 Update: Now includes graded repo_context in the analysis prompt
-    when available, giving Gemini awareness of the existing codebase
-    conventions and patterns.
+    P4: Includes graded repo_context in prompt when available.
 
-    Reads  : state["diff"], state["metadata"], state["repo_context"],
-             state["error"]
-    Writes : state["issues"], state["suggestions"], state["repo_context"]
-             state["error"], state["error_reason"] (on hard failure)
-
-    LLM Failure Behaviour
-    ---------------------
-    FREE_TIER_EXHAUSTED → degraded output, graph continues to HITL
-    LLM_ERROR           → degraded output, graph continues to HITL
-    In both cases error=False — HITL gate fires for human inspection.
+    Reads  : state["diff"], state["metadata"], state["repo_context"], state["error"]
+    Writes : state["issues"], state["suggestions"], state["error"]
     """
     if state.get("error"):
         logger.warning(
@@ -859,7 +915,6 @@ async def analyze_code_node(state: ReviewState) -> Dict:
         pr_title, len(diff), len(repo_context), context_grade,
     )
 
-    # Build context section for prompt
     context_section = ""
     if repo_context:
         context_section = (
@@ -890,25 +945,19 @@ async def analyze_code_node(state: ReviewState) -> Dict:
     result = await safe_llm_invoke(prompt)
 
     if result == FREE_TIER_EXHAUSTED:
-        logger.warning(
-            "[analyze_code_node] LLM quota exhausted — "
-            "returning degraded output, graph continues to HITL"
-        )
+        logger.warning("[analyze_code_node] LLM quota exhausted — degraded output")
         return {
-            "issues": ["LLM quota exhausted — manual review required"],
+            "issues":      ["LLM quota exhausted — manual review required"],
             "suggestions": [],
-            "error": False,
+            "error":       False,
         }
 
     if result == LLM_ERROR:
-        logger.error(
-            "[analyze_code_node] LLM error — "
-            "returning degraded output, graph continues to HITL"
-        )
+        logger.error("[analyze_code_node] LLM error — degraded output")
         return {
-            "issues": ["LLM error — manual review required"],
+            "issues":      ["LLM error — manual review required"],
             "suggestions": [],
-            "error": False,
+            "error":       False,
         }
 
     issues, suggestions = _parse_llm_output(result)
@@ -919,9 +968,9 @@ async def analyze_code_node(state: ReviewState) -> Dict:
     )
 
     return {
-        "issues": issues,
+        "issues":      issues,
         "suggestions": suggestions,
-        "error": False,
+        "error":       False,
     }
 
 
@@ -932,10 +981,6 @@ async def reflect_node(state: ReviewState) -> Dict:
 
     Controlled by REFLECTION_PASSES in workflow.py.
     Set to 0 in development (skipped entirely).
-    Set to 1 in staging/production for one additional pass.
-
-    On LLM failure, increments counter and returns existing issues unchanged
-    so the graph can proceed rather than stalling.
 
     Reads  : state["issues"], state["suggestions"], state["diff"],
              state["reflection_count"]
@@ -947,8 +992,7 @@ async def reflect_node(state: ReviewState) -> Dict:
     diff = state.get("diff", "")
 
     logger.info(
-        "[reflect_node] Pass #%d starting — "
-        "current issues=%d suggestions=%d",
+        "[reflect_node] Pass #%d starting — issues=%d suggestions=%d",
         current_count + 1, len(existing_issues), len(existing_suggestions),
     )
 
@@ -969,19 +1013,17 @@ async def reflect_node(state: ReviewState) -> Dict:
 
     if result in (FREE_TIER_EXHAUSTED, LLM_ERROR):
         logger.warning(
-            "[reflect_node] Pass #%d skipped — LLM unavailable (%s). "
-            "Incrementing count and continuing.",
+            "[reflect_node] Pass #%d skipped — LLM unavailable (%s)",
             current_count + 1, result,
         )
         return {
-            "issues": existing_issues,
-            "suggestions": existing_suggestions,
+            "issues":           existing_issues,
+            "suggestions":      existing_suggestions,
             "reflection_count": current_count + 1,
         }
 
     new_issues, new_suggestions = _parse_llm_output(result)
 
-    # Deduplicate by lowercase key while preserving original case
     merged_issues = list(
         {i.lower(): i for i in existing_issues + new_issues}.values()
     )
@@ -990,14 +1032,13 @@ async def reflect_node(state: ReviewState) -> Dict:
     )
 
     logger.info(
-        "[reflect_node] Pass #%d complete — "
-        "added %d issue(s), %d suggestion(s)",
+        "[reflect_node] Pass #%d complete — added %d issue(s), %d suggestion(s)",
         current_count + 1, len(new_issues), len(new_suggestions),
     )
 
     return {
-        "issues": merged_issues,
-        "suggestions": merged_suggestions,
+        "issues":           merged_issues,
+        "suggestions":      merged_suggestions,
         "reflection_count": current_count + 1,
     }
 
@@ -1007,10 +1048,6 @@ async def lint_node(state: ReviewState) -> Dict:
     """
     Run ruff on changed Python files inside the Docker sandbox.
 
-    Skips gracefully if:
-        - No Python files in the PR diff
-        - Docker sandbox unavailable (Docker Desktop not running)
-
     Reads  : state["diff"], state["files"]
     Writes : state["lint_result"], state["lint_passed"]
     """
@@ -1019,9 +1056,7 @@ async def lint_node(state: ReviewState) -> Dict:
     files = state.get("files", [])
 
     if not _has_python_files(files):
-        logger.info(
-            "[lint_node] No Python files in diff — skipping lint (non-fatal)"
-        )
+        logger.info("[lint_node] No Python files in diff — skipping lint")
         return {
             "lint_passed": True,
             "lint_result": "SKIPPED_NO_PYTHON_FILES",
@@ -1030,9 +1065,7 @@ async def lint_node(state: ReviewState) -> Dict:
     sandbox = get_sandbox()
 
     if not sandbox:
-        logger.warning(
-            "[lint_node] Sandbox unavailable — skipping lint"
-        )
+        logger.warning("[lint_node] Sandbox unavailable — skipping lint")
         return {
             "lint_passed": True,
             "lint_result": "SKIPPED_NO_SANDBOX",
@@ -1048,14 +1081,14 @@ async def lint_node(state: ReviewState) -> Dict:
         )
 
         return {
-            "lint_result": result,
-            "lint_passed": result.passed,
+            "lint_result":  result,
+            "lint_passed":  result.passed,
         }
 
     except Exception as e:
         logger.exception(
-            "[lint_node] Sandbox error — marking lint as passed to unblock graph. "
-            "error=%s", str(e),
+            "[lint_node] Sandbox error — marking lint as passed. error=%s",
+            str(e),
         )
         return {
             "lint_passed": True,
@@ -1066,15 +1099,33 @@ async def lint_node(state: ReviewState) -> Dict:
 @traceable(name="refactor_node", tags=["llm", "refactor"])
 async def refactor_node(state: ReviewState) -> Dict:
     """
-    Generate a corrective patch using Gemini based on issues and lint output.
+    Generate a corrective patch using Gemini and sanitize it before storage.
 
-    Only called when lint_passed=False (controlled by should_lint_refactor
-    in workflow.py). LLM-only node — does not call sandbox.
+    Patch Sanitization Pipeline
+    ---------------------------
+    The raw LLM output passes through three stages:
 
-    Reads  : state["diff"], state["issues"], state["suggestions"],
-             state["lint_result"], state["refactor_count"]
+    Stage 1 — _sanitize_patch():
+        Strips outer markdown code fences (Mode 1 hallucination).
+        Example: removes opening ```diff and closing ``` wrapper.
+
+    Stage 2 — _deep_clean_patch():
+        Removes inline backtick contamination from + lines (Mode 2 hallucination).
+        Example: strips trailing `. from `+b = str(b)`.`
+        Example: drops standalone ``` lines inside the diff content.
+
+    Stage 3 — _validate_patch_syntax():
+        Heuristic check that the cleaned patch is a structurally valid diff.
+        If validation fails, the patch is rejected and refactor_count is
+        incremented without storing the bad patch, preventing Docker from
+        receiving malformed input.
+
+    Without this pipeline, Docker receives contaminated content and
+    ruff/pytest always exit with code 1, exhausting the 2-attempt loop.
+
+    Reads  : state["diff"], state["issues"], state["lint_result"],
+             state["refactor_count"]
     Writes : state["patch"], state["refactor_count"]
-             state["suggestions"] (appends skip note on LLM failure)
     """
     logger.info("[refactor_node] Generating corrective patch")
 
@@ -1086,17 +1137,30 @@ async def refactor_node(state: ReviewState) -> Dict:
 
     lint_context = ""
     if lint_result and hasattr(lint_result, "passed") and not lint_result.passed:
-        lint_context = f"\n--- Lint Failures ---\n{lint_result.output}\n"
+        lint_context = (
+            f"\n--- Lint Failures ---\n"
+            f"{getattr(lint_result, 'output', '')}\n"
+        )
 
     prompt = [
         SystemMessage(content=(
             "You are an expert Python developer. Generate a corrective "
-            "unified diff patch that fixes all listed issues. "
-            "Respond with ONLY the raw diff — no explanations."
+            "unified diff patch that fixes all listed issues.\n\n"
+            "CRITICAL RULES — follow exactly:\n"
+            "1. Output ONLY the raw unified diff. No explanations.\n"
+            "2. Do NOT use markdown code fences (no backticks, no ```).\n"
+            "3. Do NOT include backtick characters anywhere in the output.\n"
+            "4. Start the output directly with '--- a/filename'.\n"
+            "5. Every fixed line must start with a '+' prefix.\n"
+            "6. Every removed line must start with a '-' prefix.\n"
+            "7. Context lines must start with a single space.\n\n"
+            "The output will be fed directly to a diff parser. "
+            "Any backtick will cause a Python SyntaxError in the sandbox."
         )),
         HumanMessage(content=(
-            f"--- PR Diff ---\n{diff[:2000]}\n\n"
-            f"--- Issues ---\n"
+            f"--- PR Diff (original, do not include this in output) ---\n"
+            f"{diff[:2000]}\n\n"
+            f"--- Issues to fix ---\n"
             + ("\n".join(f"- {i}" for i in issues) or "- None")
             + lint_context
         )),
@@ -1106,18 +1170,44 @@ async def refactor_node(state: ReviewState) -> Dict:
 
     if result in (FREE_TIER_EXHAUSTED, LLM_ERROR):
         logger.warning(
-            "[refactor_node] LLM unavailable (%s) — skipping patch generation",
-            result,
+            "[refactor_node] LLM unavailable (%s) — skipping patch", result,
         )
         return {
             "refactor_count": current_count + 1,
-            "suggestions": suggestions + ["Refactor skipped — LLM unavailable"],
+            "suggestions":    suggestions + ["Refactor skipped — LLM unavailable"],
         }
 
-    logger.info("[refactor_node] Patch generated — %d chars", len(result))
+    # ── Stage 1: Strip outer fences ───────────────────────────────────────────
+    stage1 = _sanitize_patch(result)
+
+    # ── Stage 2: Remove inline backtick contamination ─────────────────────────
+    stage2 = _deep_clean_patch(stage1)
+
+    # ── Stage 3: Validate patch structure ─────────────────────────────────────
+    is_valid, reason = _validate_patch_syntax(stage2)
+
+    if not is_valid:
+        logger.warning(
+            "[refactor_node] Patch failed validation — "
+            "reason=%s raw_chars=%d cleaned_chars=%d — "
+            "incrementing refactor_count without storing bad patch",
+            reason, len(result), len(stage2),
+        )
+        return {
+            "refactor_count": current_count + 1,
+            "suggestions":    suggestions + [
+                f"Refactor patch invalid ({reason}) — skipped"
+            ],
+        }
+
+    logger.info(
+        "[refactor_node] Patch ready — "
+        "raw=%d stage1=%d stage2=%d chars | valid=True",
+        len(result), len(stage1), len(stage2),
+    )
 
     return {
-        "patch": result.strip(),
+        "patch":          stage2,
         "refactor_count": current_count + 1,
     }
 
@@ -1127,12 +1217,9 @@ async def validator_node(state: ReviewState) -> Dict:
     """
     Run ruff + pytest on the generated patch inside the Docker sandbox.
 
-    The result determines whether the refactor loop continues (validation
-    failed, attempts remaining) or the workflow proceeds to memory_write_node.
-
     Reads  : state["patch"], state["refactor_count"]
     Writes : state["validation_result"], state["validation_passed"],
-             state["refactor_count"] (incremented on failure)
+             state["refactor_count"]
     """
     patch = state.get("patch", "")
     current_count = state.get("refactor_count", 0)
@@ -1151,9 +1238,7 @@ async def validator_node(state: ReviewState) -> Dict:
     sandbox = get_sandbox()
 
     if not sandbox:
-        logger.warning(
-            "[validator_node] Sandbox unavailable — marking validation as passed"
-        )
+        logger.warning("[validator_node] Sandbox unavailable — marking as passed")
         return {
             "validation_passed": True,
             "validation_result": "SKIPPED_NO_SANDBOX",
@@ -1169,9 +1254,9 @@ async def validator_node(state: ReviewState) -> Dict:
 
         if result.passed:
             return {
-                "validation_result": result,
-                "validation_passed": True,
-                "refactor_count": current_count,
+                "validation_result":  result,
+                "validation_passed":  True,
+                "refactor_count":     current_count,
             }
         else:
             logger.info(
@@ -1180,15 +1265,15 @@ async def validator_node(state: ReviewState) -> Dict:
                 current_count + 1,
             )
             return {
-                "validation_result": result,
-                "validation_passed": False,
-                "refactor_count": current_count + 1,
+                "validation_result":  result,
+                "validation_passed":  False,
+                "refactor_count":     current_count + 1,
             }
 
     except Exception as e:
         logger.exception(
-            "[validator_node] Sandbox error — marking as passed to unblock graph. "
-            "error=%s", str(e),
+            "[validator_node] Sandbox error — marking as passed. error=%s",
+            str(e),
         )
         return {
             "validation_passed": True,
@@ -1201,32 +1286,11 @@ async def memory_write_node(state: ReviewState) -> Dict:
     """
     Write review findings to ChromaDB long-term memory after each review.
 
-    After each completed review, key findings (issues, verdict, PR title)
-    are embedded and stored in ChromaDB. Future reviews on the same repo
-    will retrieve these findings via retrieve_context_node, making the
-    reviewer progressively more codebase-aware over time.
-
-    This node always returns an empty dict — it has no state outputs.
-    It only writes to ChromaDB as a side effect.
-
     Reads  : state["issues"], state["suggestions"], state["verdict"],
              state["metadata"], state["owner"], state["repo"]
-    Writes : {} (no state changes — ChromaDB write is a side effect)
+    Writes : {} — ChromaDB write is a side effect only
 
-    Failure Behaviour
-    -----------------
-    Any ChromaDB write failure is logged as a warning and the graph
-    continues. Memory writes are best-effort — a failure here should
-    never block the review from completing.
-
-    Notes
-    -----
-    Each memory entry is stored with metadata:
-        - source: "{owner}/{repo}"
-        - type: "review_memory"
-        - pr_title: PR title
-        - verdict: final verdict
-    This metadata enables future filtering by repo when querying.
+    Failure is non-fatal — any exception is logged and graph continues.
     """
     if state.get("error"):
         logger.warning(
@@ -1254,24 +1318,17 @@ async def memory_write_node(state: ReviewState) -> Dict:
     collection, embedder = get_chroma_collection()
 
     if not collection or not embedder:
-        logger.info(
-            "[memory_write_node] ChromaDB unavailable — skipping memory write"
-        )
+        logger.info("[memory_write_node] ChromaDB unavailable — skipping")
         return {}
 
     if not issues and not suggestions:
-        logger.info(
-            "[memory_write_node] No issues or suggestions to store — "
-            "skipping memory write (APPROVE verdict with no findings)"
-        )
+        logger.info("[memory_write_node] No findings to store — skipping")
         return {}
 
     try:
-        # Build memory document text
         issues_text = "\n".join(f"- {i}" for i in issues) if issues else "None"
         suggestions_text = (
-            "\n".join(f"- {s}" for s in suggestions)
-            if suggestions else "None"
+            "\n".join(f"- {s}" for s in suggestions) if suggestions else "None"
         )
 
         memory_doc = (
@@ -1283,10 +1340,7 @@ async def memory_write_node(state: ReviewState) -> Dict:
             f"Suggestions:\n{suggestions_text}"
         )
 
-        # Generate unique document ID
         doc_id = f"review_memory_{owner}_{repo}_{pr_number}_{int(time.time())}"
-
-        # Embed and store
         embedding = embedder.embed_query(memory_doc)
 
         collection.add(
@@ -1294,39 +1348,150 @@ async def memory_write_node(state: ReviewState) -> Dict:
             embeddings=[embedding],
             documents=[memory_doc],
             metadatas=[{
-                "source":   f"{owner}/{repo}",
-                "type":     "review_memory",
-                "pr_title": pr_title,
+                "source":    f"{owner}/{repo}",
+                "type":      "review_memory",
+                "pr_title":  pr_title,
                 "pr_number": str(pr_number),
-                "verdict":  verdict,
-                "author":   pr_author,
+                "verdict":   verdict,
+                "author":    pr_author,
             }],
         )
 
         logger.info(
-            "[memory_write_node] Memory written successfully — "
+            "[memory_write_node] Memory written — "
             "doc_id=%s collection_count=%d",
             doc_id, collection.count(),
         )
 
     except Exception as e:
         logger.warning(
-            "[memory_write_node] ChromaDB write failed — "
-            "graph continues without memory write. error=%s",
+            "[memory_write_node] ChromaDB write failed — continuing. error=%s",
             str(e),
         )
 
     return {}
 
 
+@traceable(name="summary_node", tags=["summary"])
+async def summary_node(state: ReviewState) -> Dict:
+    """
+    Format review findings into a Markdown HITL briefing.
+
+    Runs deterministically — no LLM call.
+    Produces a structured summary for the human reviewer before the HITL gate.
+
+    Reads  : state["issues"], state["suggestions"], state["lint_result"],
+             state["error"], state["error_reason"]
+    Writes : state["summary"]
+
+    Failure Behaviour
+    -----------------
+    Any exception returns a minimal fallback summary.
+    The graph NEVER crashes in this node.
+    """
+    try:
+        logger.info("[summary_node] Formatting findings for HITL briefing")
+
+        issues = state.get("issues") or []
+        suggestions = state.get("suggestions") or []
+        lint_result = state.get("lint_result") or {}
+        error_flag = state.get("error", False)
+        error_reason = state.get("error_reason", "")
+        context_grade = state.get("context_grade", "skipped")
+
+        # ── Extract lint details safely ────────────────────────────────────────
+        lint_passed = False
+        lint_output = ""
+        if lint_result:
+            if isinstance(lint_result, dict):
+                lint_passed = lint_result.get("passed", False)
+                lint_output = lint_result.get("output", "")
+            else:
+                lint_passed = getattr(lint_result, "passed", False)
+                lint_output = getattr(lint_result, "output", "")
+
+        # ── Context badge ──────────────────────────────────────────────────────
+        context_badge = ""
+        if context_grade == CONTEXT_GRADE_YES:
+            context_badge = " | 🧠 Context: Used"
+        elif context_grade == CONTEXT_GRADE_NO:
+            context_badge = " | ⚪ Context: Not relevant"
+
+        # ── Build markdown ─────────────────────────────────────────────────────
+        summary_text = "## 🔍 AI Code Review Briefing\n\n---\n\n"
+        summary_text += (
+            f"**Stats:** 🐛 `{len(issues)}` Issues | "
+            f"💡 `{len(suggestions)}` Suggestions | "
+            f"🚨 Lint: `{'PASSED' if lint_passed else 'FAILED'}`"
+            f"{context_badge}\n\n"
+        )
+
+        # Error section
+        if error_flag:
+            summary_text += (
+                f"### ❌ Workflow Error\n"
+                f"> **Reason:** `{error_reason or 'Internal Processing Error'}`\n\n"
+            )
+
+        # Issues section
+        if issues:
+            summary_text += "### 🐛 Issues\n"
+            for i in issues[:15]:
+                summary_text += f"- {i}\n"
+            if len(issues) > 15:
+                summary_text += f"\n*...and {len(issues) - 15} more.*\n"
+            summary_text += "\n"
+        else:
+            summary_text += "### ✅ No Issues Found\n\n"
+
+        # Suggestions section
+        if suggestions:
+            summary_text += "### 💡 Suggestions\n"
+            for s in suggestions[:10]:
+                summary_text += f"- {s}\n"
+            summary_text += "\n"
+
+        # Lint section
+        status_icon = "✅" if lint_passed else "⚠️"
+        summary_text += f"### {status_icon} Lint\n"
+        if not lint_passed and lint_output:
+            clean_output = str(lint_output).strip()[:1000]
+            summary_text += (
+                "<details>\n"
+                "<summary>Click to view lint output</summary>\n\n"
+                f"```text\n{clean_output}\n```\n"
+                "</details>\n\n"
+            )
+        elif not lint_result:
+            summary_text += "_No lint data._\n\n"
+        else:
+            summary_text += "Code style is healthy.\n\n"
+
+        # Action prompt
+        summary_text += (
+            "---\n\n"
+            "### 📝 Action Required\n"
+            "Review the findings above. "
+            "Call `POST /reviews/id/{id}/decision` with `approved` or `rejected`."
+        )
+
+        return {"summary": summary_text}
+
+    except Exception as e:
+        logger.error("[summary_node] Formatting failed — %s", str(e))
+        return {
+            "summary": (
+                "### ⚠️ Summary Generation Failed\n"
+                f"Issues count: {len(state.get('issues', []))}\n"
+                "Check logs for details."
+            )
+        }
+
+
 @traceable(name="verdict_node", tags=["verdict"])
 async def verdict_node(state: ReviewState) -> Dict:
     """
     Produce the final verdict and GitHub PR comment markdown.
-
-    Checks human_decision first — rejected produces HUMAN_REJECTED.
-    Otherwise determines APPROVE or REQUEST_CHANGES from issues list.
-    On upstream error, produces FAILED verdict with error details.
 
     Reads  : state["human_decision"], state["issues"], state["suggestions"],
              state["metadata"], state["error"], state["error_reason"]
@@ -1346,12 +1511,9 @@ async def verdict_node(state: ReviewState) -> Dict:
         human_decision, len(issues), len(suggestions), context_grade,
     )
 
-    # ── Error path ────────────────────────────────────────────────────────────
     if state.get("error"):
         reason = state.get("error_reason", "unknown_error")
-        logger.warning(
-            "[verdict_node] Upstream error detected — reason=%s", reason,
-        )
+        logger.warning("[verdict_node] Upstream error — reason=%s", reason)
         return {
             "verdict": "FAILED",
             "summary": (
@@ -1363,12 +1525,8 @@ async def verdict_node(state: ReviewState) -> Dict:
             ),
         }
 
-    # ── Human rejected ────────────────────────────────────────────────────────
     if human_decision == "rejected":
-        logger.info(
-            "[verdict_node] human_decision=rejected — "
-            "HUMAN_REJECTED, no GitHub comment posted"
-        )
+        logger.info("[verdict_node] HUMAN_REJECTED")
         return {
             "verdict": "HUMAN_REJECTED",
             "summary": (
@@ -1382,7 +1540,6 @@ async def verdict_node(state: ReviewState) -> Dict:
             ),
         }
 
-    # ── Normal verdict ────────────────────────────────────────────────────────
     verdict = "REQUEST_CHANGES" if issues else "APPROVE"
     verdict_emoji = "✅" if verdict == "APPROVE" else "🔴"
 
@@ -1392,8 +1549,7 @@ async def verdict_node(state: ReviewState) -> Dict:
     )
 
     issues_section = (
-        "\n".join(f"- {i}" for i in issues)
-        if issues else "_No issues found._"
+        "\n".join(f"- {i}" for i in issues) if issues else "_No issues found._"
     )
     suggestions_section = (
         "\n".join(f"- {s}" for s in suggestions)
@@ -1402,11 +1558,9 @@ async def verdict_node(state: ReviewState) -> Dict:
 
     human_badge = (
         "\n\n**Human Approval:** ✅ Approved by reviewer"
-        if human_decision == "approved"
-        else ""
+        if human_decision == "approved" else ""
     )
 
-    # Context badge — shows whether RAG context was used
     context_badge = ""
     if context_grade == CONTEXT_GRADE_YES:
         context_badge = "\n**Context:** 🧠 Codebase context used"

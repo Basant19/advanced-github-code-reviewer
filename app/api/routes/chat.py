@@ -1,15 +1,14 @@
 """
 app/api/routes/chat.py
 
-Chat API Routes — P4 Stub (P5 will add Gemini responses)
-----------------------------------------------------------
-Basic message persistence for PR chat threads.
-P5 will add LangGraph resume + Gemini streaming responses.
+Chat API Routes — P5
+---------------------
+POST /chat/{thread_id}/messages  — send message, get Gemini reply
+GET  /chat/{thread_id}/messages  — fetch full message history
+DELETE /chat/{thread_id}         — clear all messages in thread
 
-Endpoints:
-    POST   /chat/{thread_id}/messages  — store a message
-    GET    /chat/{thread_id}/messages  — fetch all messages
-    DELETE /chat/{thread_id}           — delete thread messages
+P5: send_message now calls process_chat_message() which generates
+a Gemini reply using review context and returns it to the caller.
 """
 
 from typing import Optional, List
@@ -46,6 +45,17 @@ class MessageResponse(BaseModel):
     created_at: Optional[str] = None
 
 
+class SendMessageResponse(BaseModel):
+    """
+    Response for POST /chat/{thread_id}/messages.
+    Returns both the stored user message and the Gemini reply.
+    """
+    thread_id:      str
+    user_message:   str
+    reply:          str
+    reply_role:     str = "assistant"
+
+
 class ThreadMessagesResponse(BaseModel):
     thread_id:     str
     message_count: int
@@ -79,42 +89,60 @@ def _handle_error(e: Exception, context: str) -> None:
 @router.post(
     "/{thread_id}/messages",
     status_code=http_status.HTTP_201_CREATED,
-    response_model=MessageResponse,
+    response_model=SendMessageResponse,
     summary="Send a message in a thread",
+    description=(
+        "Sends a user message and returns a Gemini AI reply "
+        "generated using the review context for this thread.\n\n"
+        "The thread_id is the LangGraph UUID from `Review.thread_id` — "
+        "visible in `GET /reviews/id/{id}` or `GET /reviews/{id}/status`."
+    ),
 )
 async def send_message(
     thread_id: str,
     request:   SendMessageRequest,
     db:        AsyncSession = Depends(get_db),
-) -> MessageResponse:
+) -> SendMessageResponse:
     """
-    Store a message in the thread.
-    Thread is created automatically if it does not exist.
-    P5 will add Gemini response generation here.
+    Store user message and return Gemini reply.
+
+    The Gemini reply is generated with full review context:
+    - PR verdict and summary from the linked Review record
+    - Conversation history from this thread
+    - System prompt instructing Gemini to act as code review assistant
     """
     logger.info(
-        "[chat_route] Send message — thread_id=%s role=%s",
-        thread_id, request.role,
+        "[chat_route] Send message — thread_id=%s role=%s chars=%d",
+        thread_id, request.role, len(request.content),
     )
 
     try:
         service = ChatService(db)
-        message = await service.add_message(
+        reply = await service.process_chat_message(
             thread_id=thread_id,
-            role=request.role,
-            content=request.content,
+            user_message=request.content,
         )
 
-        return MessageResponse(
-            id=message.id,
+        return SendMessageResponse(
             thread_id=thread_id,
-            role=message.role,
-            content=message.content,
-            created_at=str(message.created_at) if message.created_at else None,
+            user_message=request.content,
+            reply=reply,
+            reply_role="assistant",
         )
 
     except CustomException as e:
         _handle_error(e, "send_message")
+
+    except Exception as e:
+        logger.exception(
+            "[chat_route] send_message unexpected error — "
+            "thread_id=%s error=%s",
+            thread_id, str(e),
+        )
+        raise HTTPException(
+            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal error during send_message",
+        )
 
 
 @router.get(
@@ -122,20 +150,21 @@ async def send_message(
     status_code=http_status.HTTP_200_OK,
     response_model=ThreadMessagesResponse,
     summary="Get all messages in a thread",
+    description=(
+        "Returns all messages in the thread ordered oldest first.\n\n"
+        "Returns empty messages list if thread has no messages yet. "
+        "Returns 404 if thread does not exist."
+    ),
 )
 async def get_messages(
     thread_id: str,
     db:        AsyncSession = Depends(get_db),
 ) -> ThreadMessagesResponse:
-    """
-    Returns all messages in a thread ordered by creation time.
-    Returns empty list if thread has no messages.
-    Returns 404 if thread does not exist.
-    """
+    """Fetch full message history for a thread."""
     logger.info("[chat_route] Get messages — thread_id=%s", thread_id)
 
     try:
-        service = ChatService(db)
+        service  = ChatService(db)
         messages = await service.get_thread_messages(thread_id=thread_id)
 
         return ThreadMessagesResponse(
@@ -162,15 +191,13 @@ async def get_messages(
     status_code=http_status.HTTP_200_OK,
     response_model=DeleteThreadResponse,
     summary="Delete all messages in a thread",
+    description="Clears all messages. Returns 404 if thread does not exist.",
 )
 async def delete_thread(
     thread_id: str,
     db:        AsyncSession = Depends(get_db),
 ) -> DeleteThreadResponse:
-    """
-    Deletes all messages in a thread.
-    Returns 404 if thread does not exist.
-    """
+    """Delete all messages for a thread."""
     logger.info("[chat_route] Delete thread — thread_id=%s", thread_id)
 
     try:
@@ -185,3 +212,4 @@ async def delete_thread(
 
     except CustomException as e:
         _handle_error(e, "delete_thread")
+

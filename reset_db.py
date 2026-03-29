@@ -1,3 +1,4 @@
+#E:\advanced-github-code-reviewer\reset_db.py
 import sys
 import asyncio
 from app.db.base import Base

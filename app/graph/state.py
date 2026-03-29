@@ -167,6 +167,7 @@ def build_initial_state(
     owner: str,
     repo: str,
     pr_number: int,
+    thread_id: str = "",
 ) -> ReviewState:
     """
     Validate inputs and construct a complete, safe initial ReviewState.
@@ -224,7 +225,7 @@ def build_initial_state(
         # ── Value normalization ───────────────────────────────────────────────
         owner = owner.strip()
         repo = repo.strip()
-
+        thread_id = thread_id.strip()
         if not owner:
             raise ValueError("owner must not be empty string")
         if not repo:
@@ -241,6 +242,7 @@ def build_initial_state(
             "owner":     owner,
             "repo":      repo,
             "pr_number": pr_number,
+            "thread_id": thread_id,
 
             # GITHUB DATA — populated by fetch_diff_node
             "metadata": {},
