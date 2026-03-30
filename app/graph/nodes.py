@@ -1046,54 +1046,37 @@ async def reflect_node(state: ReviewState) -> Dict:
 @traceable(name="lint_node", tags=["sandbox", "lint"])
 async def lint_node(state: ReviewState) -> Dict:
     """
-    Run ruff on changed Python files inside the Docker sandbox.
-
-    Reads  : state["diff"], state["files"]
-    Writes : state["lint_result"], state["lint_passed"]
+    Run ruff via Docker sandbox. SandboxResult stored as plain dict
+    to avoid LangGraph checkpoint serialization warning.
     """
+    from dataclasses import asdict as dataclass_asdict
+
     logger.info("[lint_node] Starting")
 
     files = state.get("files", [])
 
     if not _has_python_files(files):
-        logger.info("[lint_node] No Python files in diff — skipping lint")
-        return {
-            "lint_passed": True,
-            "lint_result": "SKIPPED_NO_PYTHON_FILES",
-        }
+        logger.info("[lint_node] No Python files — skipping lint")
+        return {"lint_passed": True, "lint_result": "SKIPPED_NO_PYTHON_FILES"}
 
     sandbox = get_sandbox()
-
     if not sandbox:
         logger.warning("[lint_node] Sandbox unavailable — skipping lint")
-        return {
-            "lint_passed": True,
-            "lint_result": "SKIPPED_NO_SANDBOX",
-        }
+        return {"lint_passed": True, "lint_result": "SKIPPED_NO_SANDBOX"}
 
     try:
         diff = state.get("diff", "")
         result = sandbox.run_lint(diff)
-
-        logger.info(
-            "[lint_node] Complete — passed=%s exit_code=%s duration=%sms",
-            result.passed, result.exit_code, result.duration_ms,
-        )
-
+        logger.info("[lint_node] Complete — passed=%s exit_code=%s duration=%sms",
+                    result.passed, result.exit_code, result.duration_ms)
         return {
-            "lint_result":  result,
+            "lint_result":  dataclass_asdict(result),
             "lint_passed":  result.passed,
         }
-
     except Exception as e:
-        logger.exception(
-            "[lint_node] Sandbox error — marking lint as passed. error=%s",
-            str(e),
-        )
-        return {
-            "lint_passed": True,
-            "lint_result": "SKIPPED_SANDBOX_ERROR",
-        }
+        logger.exception("[lint_node] Sandbox error — marking as passed. error=%s", str(e))
+        return {"lint_passed": True, "lint_result": "SKIPPED_SANDBOX_ERROR"}
+
 
 
 @traceable(name="refactor_node", tags=["llm", "refactor"])
@@ -1136,11 +1119,8 @@ async def refactor_node(state: ReviewState) -> Dict:
     current_count = state.get("refactor_count", 0)
 
     lint_context = ""
-    if lint_result and hasattr(lint_result, "passed") and not lint_result.passed:
-        lint_context = (
-            f"\n--- Lint Failures ---\n"
-            f"{getattr(lint_result, 'output', '')}\n"
-        )
+    if isinstance(lint_result, dict) and not lint_result.get("passed", True):
+            lint_context = f"\n--- Lint Failures ---\n{lint_result.get('output', '')}\n"
 
     prompt = [
         SystemMessage(content=(
@@ -1211,74 +1191,51 @@ async def refactor_node(state: ReviewState) -> Dict:
         "refactor_count": current_count + 1,
     }
 
-
 @traceable(name="validator_node", tags=["sandbox", "validation"])
 async def validator_node(state: ReviewState) -> Dict:
     """
-    Run ruff + pytest on the generated patch inside the Docker sandbox.
-
-    Reads  : state["patch"], state["refactor_count"]
-    Writes : state["validation_result"], state["validation_passed"],
-             state["refactor_count"]
+    Run ruff + pytest via Docker sandbox. SandboxResult stored as plain dict
+    to avoid LangGraph checkpoint serialization warning.
     """
+    from dataclasses import asdict as dataclass_asdict
+
     patch = state.get("patch", "")
     current_count = state.get("refactor_count", 0)
 
-    logger.info(
-        "[validator_node] Starting validation — iteration=%d", current_count,
-    )
+    logger.info("[validator_node] Starting validation — iteration=%d", current_count)
 
     if not patch or ".py" not in patch:
-        logger.info("[validator_node] No Python patch to validate — skipping")
-        return {
-            "validation_passed": True,
-            "validation_result": "SKIPPED_NO_PYTHON_PATCH",
-        }
+        logger.info("[validator_node] No Python patch — skipping")
+        return {"validation_passed": True, "validation_result": "SKIPPED_NO_PYTHON_PATCH"}
 
     sandbox = get_sandbox()
-
     if not sandbox:
         logger.warning("[validator_node] Sandbox unavailable — marking as passed")
-        return {
-            "validation_passed": True,
-            "validation_result": "SKIPPED_NO_SANDBOX",
-        }
+        return {"validation_passed": True, "validation_result": "SKIPPED_NO_SANDBOX"}
 
     try:
         result = sandbox.run_tests(patch)
+        logger.info("[validator_node] Complete — passed=%s exit_code=%s duration=%sms",
+                    result.passed, result.exit_code, result.duration_ms)
 
-        logger.info(
-            "[validator_node] Complete — passed=%s exit_code=%s duration=%sms",
-            result.passed, result.exit_code, result.duration_ms,
-        )
+        validation_dict = dataclass_asdict(result)
 
         if result.passed:
             return {
-                "validation_result":  result,
-                "validation_passed":  True,
-                "refactor_count":     current_count,
+                "validation_result": validation_dict,
+                "validation_passed": True,
+                "refactor_count":    current_count,
             }
         else:
-            logger.info(
-                "[validator_node] Validation FAILED — "
-                "incrementing refactor_count to %d",
-                current_count + 1,
-            )
+            logger.info("[validator_node] FAILED — incrementing refactor_count to %d", current_count + 1)
             return {
-                "validation_result":  result,
-                "validation_passed":  False,
-                "refactor_count":     current_count + 1,
+                "validation_result": validation_dict,
+                "validation_passed": False,
+                "refactor_count":    current_count + 1,
             }
-
     except Exception as e:
-        logger.exception(
-            "[validator_node] Sandbox error — marking as passed. error=%s",
-            str(e),
-        )
-        return {
-            "validation_passed": True,
-            "validation_result": "SKIPPED_SANDBOX_ERROR",
-        }
+        logger.exception("[validator_node] Sandbox error — marking as passed. error=%s", str(e))
+        return {"validation_passed": True, "validation_result": "SKIPPED_SANDBOX_ERROR"}
 
 
 @traceable(name="memory_write_node", tags=["chromadb", "memory", "p4"])
