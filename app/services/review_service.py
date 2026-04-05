@@ -680,214 +680,103 @@ async def decide_review(
     db: AsyncSession,
 ) -> Review:
     """
-    Resume the LangGraph graph after a human approve or reject decision.
-
-    Validates the review is in pending_hitl state, then calls
-    graph.ainvoke(Command(resume=decision)) to resume from the MemorySaver
-    checkpoint. The graph executes hitl_node (which reads the decision via
-    interrupt() return value) and then verdict_node, producing the final
-    verdict and summary.
-
-    After completion:
-    - verdict and summary are persisted to the Review record
-    - status is set to "completed" (approved) or "rejected" (rejected)
-    - GitHub PR comment is posted unless verdict is HUMAN_REJECTED
-
-    Decision Values
-    ---------------
-    "approved"  — graph continues, verdict determined by AI findings
-                  (APPROVE if no issues, REQUEST_CHANGES if issues found)
-    "rejected"  — verdict set to HUMAN_REJECTED, no GitHub comment posted
-
-    Parameters
-    ----------
-    review_id : int
-        ID of the Review record to resume.
-    decision : str
-        Human decision: "approved" or "rejected".
-    db : AsyncSession
-        Active async database session from get_db() dependency.
-
-    Returns
-    -------
-    Review
-        Updated review record with status="completed" or "rejected",
-        verdict and summary populated.
-
-    Raises
-    ------
-    CustomException
-        If review not found, not in pending_hitl state, or graph fails.
-        Re-raises CustomException from validation checks unchanged.
+    Resume the LangGraph graph after a human decision using persistent checkpoints.
     """
-    graph = get_review_graph()
+    # 1. Initialize Graph with Persistent Checkpointer
+    # In a real app, 'get_review_graph' should return a graph compiled with PostgresSaver
+    graph = get_review_graph() 
 
     try:
         logger.info(
-            "[decide_review] Processing decision — "
-            "review_id=%d decision=%s",
+            "[decide_review] Processing decision — review_id=%d decision=%s",
             review_id, decision,
         )
 
-        # ── Fetch and validate review ─────────────────────────────────────────
+        # ── 2. Fetch and validate review ──────────────────────────────────────
+        # We use selectinload to ensure PR and Repo data are available for GitHub posting
         result = await db.execute(
-            select(Review).where(Review.id == review_id)
+            select(Review)
+            .options(
+                selectinload(Review.pull_request)
+                .selectinload(PullRequest.repository)
+            )
+            .where(Review.id == review_id)
         )
         review = result.scalar_one_or_none()
 
         if not review:
-            logger.error(
-                "[decide_review] Review not found — review_id=%d",
-                review_id,
-            )
-            raise CustomException(
-                f"Review {review_id} not found", sys
-            )
+            logger.error("[decide_review] Review not found — review_id=%d", review_id)
+            raise CustomException(f"Review {review_id} not found", sys)
 
         if review.status != "pending_hitl":
             logger.error(
-                "[decide_review] Invalid review state — "
-                "review_id=%d expected=pending_hitl actual=%s",
+                "[decide_review] Invalid state — id=%d actual=%s",
                 review_id, review.status,
             )
             raise CustomException(
-                f"Review {review_id} is not pending HITL approval — "
-                f"current status: {review.status}. "
-                f"Only reviews with status='pending_hitl' can be approved "
-                f"or rejected.",
-                sys,
+                f"Review {review_id} is {review.status}, not pending_hitl.", sys
             )
 
         config = {"configurable": {"thread_id": review.thread_id}}
 
-        logger.info(
-            "[decide_review] Resuming graph — "
-            "review_id=%d thread_id=%s decision=%s",
-            review.id, review.thread_id, decision,
-        )
+        # ── 3. Verify Checkpoint Exists ───────────────────────────────────────
+        # Even with persistence, we check if the state exists to avoid empty runs
+        snapshot = await graph.aget_state(config)
+        if not snapshot or not snapshot.values:
+            logger.error(
+                "[decide_review] Checkpoint missing — id=%d thread=%s. "
+                "Possible DB cleanup or manual deletion.",
+                review_id, review.thread_id,
+            )
+            review.status = "failed"
+            review.verdict = "ERROR"
+            review.summary = "## ❌ Error: State lost. Please re-trigger review."
+            await db.commit()
+            raise CustomException("Graph state not found. Cannot resume.", sys)
 
-        # ── Resume graph via Command(resume=decision) ─────────────────────────
-        # Command(resume=decision) injects the decision string into the
-        # MemorySaver checkpoint. When hitl_node executes, interrupt()
-        # returns the injected decision string.
-        # ainvoke() is used here (not astream) since we want the final
-        # merged state dict returned synchronously after completion.
+        # ── 4. Resume Graph ───────────────────────────────────────────────────
+        logger.info("[decide_review] Resuming graph — thread_id=%s", review.thread_id)
+        
         final_state = await graph.ainvoke(
             Command(resume=decision),
             config=config,
         )
 
-        logger.info(
-            "[decide_review] Graph completed — "
-            "review_id=%d verdict=%s",
-            review.id,
-            final_state.get("verdict", "unknown"),
-        )
-
-        # ── Persist remaining ReviewStep records ──────────────────────────────
-        # The first call in trigger_review() persisted steps up to lint.
-        # This call persists verdict and summary (added after HITL resume).
-        # Idempotency in _persist_review_steps prevents any duplicate inserts.
-        if final_state:
-            try:
-                await _persist_review_steps(db, review, final_state)
-            except Exception:
-                logger.warning(
-                    "[decide_review] Step persistence failed — "
-                    "continuing without updated steps review_id=%d",
-                    review.id,
-                    exc_info=True,
-                )
-
-        # ── Update review record ──────────────────────────────────────────────
-        review.verdict = final_state.get("verdict", "")
+        # ── 5. Persist Results & Metadata ─────────────────────────────────────
+        review.verdict = final_state.get("verdict", "UNKNOWN")
         review.summary = final_state.get("summary", "")
         review.status = "completed" if decision == "approved" else "rejected"
 
-        logger.info(
-            "[decide_review] Review finalized — "
-            "id=%d status=%s verdict=%s summary_chars=%d",
-            review.id,
-            review.status,
-            review.verdict,
-            len(review.summary) if review.summary else 0,
-        )
+        # Save verdict/summary steps to DB
+        try:
+            await _persist_review_steps(db, review, final_state)
+        except Exception:
+            logger.warning("[decide_review] Step persistence failed, continuing...", exc_info=True)
 
-        # ── Post GitHub comment ───────────────────────────────────────────────
-        # Skip posting if verdict is HUMAN_REJECTED — the human chose not
-        # to publish this review to the PR.
+        # ── 6. Post to GitHub ─────────────────────────────────────────────────
         if review.verdict != "HUMAN_REJECTED" and review.summary:
             try:
-                pr_result = await db.execute(
-                    select(PullRequest).where(
-                        PullRequest.id == review.pull_request_id
-                    )
+                pr = review.pull_request
+                repo = pr.repository
+                
+                gh = GitHubClient()
+                gh.post_review_comment(
+                    repo.owner, repo.name, pr.pr_number, review.summary
                 )
-                pr = pr_result.scalar_one_or_none()
-
-                repo_result = await db.execute(
-                    select(Repository).where(
-                        Repository.id == pr.repo_id
-                    )
-                )
-                repo = repo_result.scalar_one_or_none()
-
-                if pr and repo:
-                    gh = GitHubClient()
-                    gh.post_review_comment(
-                        repo.owner,
-                        repo.name,
-                        pr.pr_number,
-                        review.summary,
-                    )
-                    logger.info(
-                        "[decide_review] GitHub comment posted — "
-                        "%s/%s#%d review_id=%d",
-                        repo.owner, repo.name, pr.pr_number, review.id,
-                    )
-                else:
-                    logger.warning(
-                        "[decide_review] Could not post GitHub comment — "
-                        "pr or repo not found review_id=%d",
-                        review.id,
-                    )
-
+                logger.info("[decide_review] GitHub comment posted for PR #%d", pr.pr_number)
             except Exception:
-                logger.warning(
-                    "[decide_review] GitHub comment failed — "
-                    "review saved, comment not posted review_id=%d",
-                    review.id,
-                    exc_info=True,
-                )
-        else:
-            logger.info(
-                "[decide_review] Skipping GitHub comment — "
-                "verdict=%s review_id=%d",
-                review.verdict, review.id,
-            )
+                logger.exception("[decide_review] GitHub posting failed")
 
         await db.commit()
         await db.refresh(review)
-
-        logger.info(
-            "[decide_review] Complete — "
-            "review_id=%d status=%s verdict=%s",
-            review.id, review.status, review.verdict,
-        )
-
+        
         return review
 
     except CustomException:
-        # Re-raise validation errors unchanged — do not wrap them again
         raise
-
     except Exception as e:
-        logger.exception(
-            "[decide_review] Unrecoverable error — "
-            "review_id=%d error=%s",
-            review_id, str(e),
-        )
-        raise CustomException(str(e), sys)
+        logger.exception("[decide_review] Unrecoverable error — id=%d", review_id)
+        raise CustomException(f"Critical failure during resume: {str(e)}", sys)
 
 
 # ── Query Functions ───────────────────────────────────────────────────────────

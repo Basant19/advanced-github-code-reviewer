@@ -1,153 +1,177 @@
-"""
-streamlit_app/pages/review_chat.py
-
-Per-PR Chat UI — P4 Stub / P5 Foundation
-------------------------------------------
-P4: Display and send messages using the real /chat/{thread_id}/messages endpoints.
-P5: Add Gemini streaming responses and memory-aware conversation.
-
-Usage:
-    streamlit run streamlit_app/dashboard.py
-    Navigate to this page and pass ?thread_id=<uuid> in URL.
-
-The thread_id is the Review.thread_id UUID — visible in GET /reviews/id/{id}
-or GET /reviews/{id}/status response.
-"""
-
-import streamlit as st
 import requests
-from typing import List, Dict
+import streamlit as st
+import os
+import time  # Added for better streaming control
+from dotenv import load_dotenv
 
-API_BASE_URL = "http://localhost:8000"
+# ── Configuration ──
+load_dotenv()
+API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000")
 
-st.set_page_config(page_title="Review Chat", layout="wide")
+st.set_page_config(page_title="Review Chat", layout="wide", page_icon="💬")
 
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Data Fetching Helpers ──
 
 def get_thread_id() -> str:
-    """Get thread_id from URL query params."""
+    """
+    Robustly extract thread_id from query params.
+    Uses the new st.query_params API (Streamlit 1.30+).
+    """
+    # Fix: Ensure we handle the case where thread_id might be a list or missing
     params = st.query_params
-    thread_id = params.get("thread_id", None)
-
+    thread_id = params.get("thread_id")
+    
     if not thread_id:
-        st.error(
-            "Missing thread_id in URL.\n\n"
-            "Example: ?thread_id=d6e5c473-beeb-44fd-b314-ebef4d3de874\n\n"
-            "Find the thread_id in the review details response."
+        st.error("### ❌ Missing `thread_id`")
+        st.info(
+            "This page requires a valid thread context. \n\n"
+            "Please open this chat via the **'Open Chat'** button on the Review Detail page."
         )
+        if st.button("⬅️ Back to Dashboard"):
+            st.switch_page("dashboard.py")
         st.stop()
-
     return thread_id
 
-
-def fetch_messages(thread_id: str) -> List[Dict]:
-    """Fetch chat history from GET /chat/{thread_id}/messages."""
+def fetch_history(thread_id: str) -> list:
+    """Load existing messages from GET /chat/{thread_id}/messages."""
     try:
-        res = requests.get(
-            f"{API_BASE_URL}/chat/{thread_id}/messages",
-            timeout=10,
-        )
-        if res.status_code == 200:
-            data = res.json()
-            return data.get("messages", [])
-        elif res.status_code == 404:
-            return []  # thread has no messages yet
+        r = requests.get(f"{API_BASE}/chat/{thread_id}/messages", timeout=10)
+        if r.status_code == 200:
+            # Matches the ThreadMessagesResponse schema from chat.py
+            return r.json().get("messages", [])
         return []
     except Exception as e:
-        st.warning(f"Could not load message history: {e}")
+        st.error(f"Error connecting to Chat API: {e}")
         return []
 
+def fetch_review_context(thread_id: str) -> dict:
+    """
+    Finds the specific review linked to this thread.
+    Required because chat needs metadata (PR#, Repo) for the header.
+    """
+    try:
+        # We use the list endpoint which we verified returns thread_id
+        r = requests.get(f"{API_BASE}/reviews/", timeout=10)
+        if r.status_code == 200:
+            reviews = r.json()
+            # Search for the review matching our thread
+            return next((rev for rev in reviews if rev.get("thread_id") == thread_id), {})
+    except Exception:
+        pass
+    return {}
 
-def send_message(thread_id: str, content: str, role: str = "user") -> Dict:
-    """Send message via POST /chat/{thread_id}/messages."""
-    res = requests.post(
-        f"{API_BASE_URL}/chat/{thread_id}/messages",
-        json={"content": content, "role": role},
-        timeout=30,
-    )
-
-    if res.status_code not in (200, 201):
-        raise Exception(
-            f"Failed to send message: {res.status_code} {res.text}"
+def send_chat_message(thread_id: str, content: str) -> dict:
+    """POST /chat/{thread_id}/messages."""
+    try:
+        r = requests.post(
+            f"{API_BASE}/chat/{thread_id}/messages",
+            json={"content": content, "role": "user"},
+            timeout=60,
         )
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        st.error(f"Failed to send message: {e}")
+        return {}
 
-    return res.json()
-
-
-# ── Session State ─────────────────────────────────────────────────────────────
-
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-if "thread_loaded" not in st.session_state:
-    st.session_state.thread_loaded = False
-
-
-# ── Main UI ───────────────────────────────────────────────────────────────────
+# ── Session Management ──
 
 thread_id = get_thread_id()
 
-st.title(f"💬 Review Chat")
-st.caption(f"Thread: `{thread_id}`")
+if "messages" not in st.session_state or st.session_state.get("last_thread") != thread_id:
+    st.session_state.messages = fetch_history(thread_id)
+    st.session_state.last_thread = thread_id
 
-# ── Load history once ─────────────────────────────────────────────────────────
+# ── UI Layout ──
 
-if not st.session_state.thread_loaded:
-    history = fetch_messages(thread_id)
-    st.session_state.messages = history
-    st.session_state.thread_loaded = True
+# Header Area
+review_ctx = fetch_review_context(thread_id)
+col1, col2 = st.columns([3, 1])
 
-# ── Display messages ──────────────────────────────────────────────────────────
+with col1:
+    if review_ctx:
+        repo = review_ctx.get('repo', 'Unknown Repo')
+        pr = review_ctx.get('pr_number', '??')
+        st.title(f"💬 Chat: {repo} #{pr}")
+    else:
+        st.title("💬 Review Chat")
+    st.caption(f"Thread Session: `{thread_id}`")
 
+with col2:
+    if st.button("🔄 Refresh History", use_container_width=True):
+        st.session_state.messages = fetch_history(thread_id)
+        st.rerun()
+
+st.divider()
+
+# ── Chat Display ──
+
+# Display history
 for msg in st.session_state.messages:
-    role    = msg.get("role", "assistant")
+    # Handle both database objects and dictionary formats
+    role = msg.get("role", "assistant")
     content = msg.get("content", "")
     with st.chat_message(role):
         st.markdown(content)
 
-# ── Note about P5 ─────────────────────────────────────────────────────────────
-
-st.info(
-    "**P4 stub:** Messages are stored but AI responses are not yet generated. "
-    "P5 will add Gemini-powered responses with review context awareness."
-)
-
-# ── Input ─────────────────────────────────────────────────────────────────────
-
-user_input = st.chat_input("Ask about this PR review...")
-
-if user_input:
-    # Show user message
-    st.session_state.messages.append({"role": "user", "content": user_input})
+# Chat Input
+if prompt := st.chat_input("Ask a question about the code or requested changes..."):
+    # 1. Add user message to UI
+    st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
-        st.markdown(user_input)
+        st.markdown(prompt)
 
-    # Store user message via API
+    # 2. Generate Assistant Response
     with st.chat_message("assistant"):
-        placeholder = st.empty()
+        response_placeholder = st.empty()
+        response_placeholder.markdown("*(Gemini is analyzing context...)*")
+        
+        result = send_chat_message(thread_id, prompt)
+        
+        if result:
+            full_response = result.get("reply", "No response received.")
+            
+            # Streaming effect: avoid the "split()" flickering bug by 
+            # building the string properly
+            displayed_text = ""
+            for char in full_response:
+                displayed_text += char
+                response_placeholder.markdown(displayed_text + "▌")
+                time.sleep(0.005) # Subtle realistic pacing
+            
+            response_placeholder.markdown(full_response)
+            
+            # Update session state
+            st.session_state.messages.append({
+                "role": "assistant", 
+                "content": full_response
+            })
+        else:
+            response_placeholder.error("I encountered an error processing that request.")
 
+# ── Sidebar ──
+
+with st.sidebar:
+    st.image("https://cdn-icons-png.flaticon.com/512/2111/2111432.png", width=50) # GitHub Icon
+    st.header("Context")
+    
+    if review_ctx:
+        st.success(f"**Verdict:** {review_ctx.get('verdict', 'PENDING')}")
+        st.write(f"**Status:** {review_ctx.get('status', '—')}")
+        st.write(f"**Created:** {review_ctx.get('created_at', '—')[:10]}")
+    else:
+        st.warning("Context not found in active reviews.")
+
+    st.divider()
+    
+    if st.button("🗑️ Clear Thread", use_container_width=True, type="secondary"):
         try:
-            send_message(thread_id, user_input, role="user")
-
-            # P4 stub response — P5 will replace this with Gemini streaming
-            stub_response = (
-                "✅ Message received and stored. "
-                "AI responses will be available in P5 once "
-                "the Gemini chat integration is complete."
-            )
-
-            placeholder.markdown(stub_response)
-
-            st.session_state.messages.append({
-                "role": "assistant",
-                "content": stub_response,
-            })
-
+            requests.delete(f"{API_BASE}/chat/{thread_id}", timeout=5)
+            st.session_state.messages = []
+            st.success("History cleared locally and on server.")
+            st.rerun()
         except Exception as e:
-            error_msg = f"❌ Error: {e}"
-            placeholder.markdown(error_msg)
-            st.session_state.messages.append({
-                "role": "assistant",
-                "content": error_msg,
-            })
+            st.error(f"Delete failed: {e}")
+            
+    if st.button("🏠 Exit to Dashboard", use_container_width=True):
+        st.switch_page("dashboard.py")

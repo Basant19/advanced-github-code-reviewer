@@ -79,6 +79,7 @@ class Settings(BaseSettings):
 
     # ── Database ──────────────────────────────────────────────────────────────
     DATABASE_URL: str = Field(..., alias="DATABASE_URL")
+    CHECKPOINTER_DB_URL: str = Field(..., alias="CHECKPOINTER_DB_URL")
 
     # ── Pydantic Settings config ──────────────────────────────────────────────
     model_config = SettingsConfigDict(
@@ -98,6 +99,7 @@ try:
         "LANGSMITH_API_KEY":     settings.langsmith_api_key,
         "GITHUB_WEBHOOK_SECRET": settings.github_webhook_secret,
         "DATABASE_URL":          settings.DATABASE_URL,
+        "CHECKPOINTER_DB_URL":    settings.CHECKPOINTER_DB_URL,
     }
     _missing = [k for k, v in _required.items() if not v]
     if _missing:
@@ -120,6 +122,7 @@ try:
     logger.info(f"GITHUB_TOKEN loaded    : {bool(settings.github_token)}")
     logger.info(f"LANGSMITH tracing      : {settings.LANGSMITH_TRACING}")
     logger.info(f"DATABASE_URL loaded    : {bool(settings.DATABASE_URL)}")
+    logger.info(f"CHECKPOINTER_DB loaded : {bool(settings.CHECKPOINTER_DB_URL)}")
 
 except Exception as e:
     logger.error(f"Failed to load application configuration: {e}")
