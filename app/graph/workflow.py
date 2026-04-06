@@ -294,12 +294,23 @@ def _use_memory_saver() -> None:
 # ── Public Accessor ───────────────────────────────────────────────────────────
 
 def get_review_graph():
+    """
+    Return the compiled graph singleton.
+
+    Raises RuntimeError if called before init_checkpointer() has run.
+    This enforces fail-fast behavior — a missing graph means startup
+    ordering is broken and silent MemorySaver fallback would cause
+    checkpoints to be lost silently.
+
+    In production: always returns AsyncPostgresSaver-backed graph.
+    In tests: call _use_memory_saver() directly in test fixtures.
+    """
     global _review_graph
     if _review_graph is None:
-        logger.warning(
-            "[workflow] get_review_graph called before init_checkpointer() completed. "
-            "This is a startup ordering bug — graph should be built in on_startup(). "
-            "Using MemorySaver fallback."
+        raise RuntimeError(
+            "[workflow] get_review_graph() called before init_checkpointer() completed. "
+            "This means a request was served before startup finished — "
+            "this should be impossible with lifespan management. "
+            "If you see this in tests, call _use_memory_saver() in your test fixture."
         )
-        _use_memory_saver()
     return _review_graph

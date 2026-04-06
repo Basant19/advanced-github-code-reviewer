@@ -1,40 +1,55 @@
 """
-app/api/deps.py - FastAPI Dependency Injection (P5 Updated)
+app/api/deps.py — FastAPI dependency injection.
 """
-
+import sys
 from collections.abc import AsyncGenerator
+
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.session import AsyncSessionLocal
+from app.core.exceptions import CustomException
 from app.core.logger import get_logger
-from app.graph.workflow import get_review_graph  # Your graph builder function
+from app.db.session import AsyncSessionLocal
 
 logger = get_logger(__name__)
 
-# --- SINGLETON GRAPH INSTANCE ---
-# We compile the graph once when the app starts.
-# This ensures all threads/requests share the same state logic.
-_compiled_graph = get_review_graph()
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     """
     Yields an async SQLAlchemy session.
-    Guarantees the session is closed after the request.
+
+    Commit is called only if the route completes without raising.
+    CustomException propagates untouched so route error handlers see
+    the original message and status code.
+    Only unexpected infrastructure errors are re-wrapped.
     """
     async with AsyncSessionLocal() as session:
         try:
             yield session
-        finally:
-            # Note: 'async with' handles closing, but explicit close is safe
-            await session.close()
+            await session.commit()
+        except CustomException:
+            # Business logic exception — rollback and re-raise unchanged.
+            # Do NOT wrap in another CustomException.
+            await session.rollback()
+            raise
+        except Exception as e:
+            await session.rollback()
+            logger.error("[deps] Database session error: %s", str(e))
+            raise CustomException(f"Database session failed: {e}", sys)
+
 
 def get_graph():
     """
-    Dependency that returns the pre-compiled LangGraph instance.
-    Injected via Depends(get_graph).
+    Dependency that returns the compiled LangGraph graph singleton.
+    Fails loudly if called before lifespan startup completes.
     """
-    if _compiled_graph is None:
-        logger.error("LangGraph was not initialized correctly!")
-        # Fallback to compilation if needed, though get_workflow should handle it
+    from app.graph.workflow import get_review_graph
+    try:
         return get_review_graph()
-    return _compiled_graph
+    except RuntimeError as e:
+        logger.critical(
+            "[deps] Graph not initialized — lifespan startup incomplete: %s", str(e)
+        )
+        raise CustomException(str(e), sys)
+    except Exception as e:
+        logger.exception("[deps] Unexpected error fetching graph")
+        raise CustomException(f"Graph dependency failure: {e}", sys)

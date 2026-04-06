@@ -1,3 +1,4 @@
+#E:\advanced-github-code-reviewer\streamlit_app\dashboard.py
 import requests
 import streamlit as st
 import os
@@ -155,6 +156,7 @@ else:
                     )
 
             # ── QUICK HITL ACTIONS ──
+           
             if status == "pending_hitl":
                 st.divider()
                 st.warning("Review paused. Human intervention required.")
@@ -162,31 +164,37 @@ else:
                 
                 with btn_col1:
                     if st.button("✅ Approve", key=f"app_{review_id}", type="primary", use_container_width=True):
-                        # FIX: Point to correct decision endpoint with JSON payload
                         r = requests.post(
                             f"{API_BASE}/reviews/id/{review_id}/decision", 
-                            json={"decision": "approved"}
+                            json={"decision": "approved"},
+                            timeout=30
                         )
                         if r.status_code == 200:
                             st.toast(f"Review #{review_id} approved!", icon="✅")
                             time.sleep(1)
                             st.rerun()
+                        elif r.status_code == 409:
+                            # Handle the missing checkpoint gracefully
+                            st.error(f"⚠️ Review #{review_id} state lost. Trigger a new review.")
                         else:
-                            st.error(f"Approval failed: {r.status_code}")
+                            st.error(f"Approval failed: {r.status_code} — {r.text}")
 
                 with btn_col2:
                     if st.button("❌ Reject", key=f"rej_{review_id}", use_container_width=True):
-                        # FIX: Point to correct decision endpoint with JSON payload
                         r = requests.post(
                             f"{API_BASE}/reviews/id/{review_id}/decision", 
-                            json={"decision": "rejected"}
+                            json={"decision": "rejected"},
+                            timeout=30
                         )
                         if r.status_code == 200:
                             st.toast(f"Review #{review_id} rejected.", icon="🚫")
                             time.sleep(1)
                             st.rerun()
+                        elif r.status_code == 409:
+                            st.error(f"⚠️ Review #{review_id} state lost. Trigger a new review.")
                         else:
                             st.error(f"Rejection failed: {r.status_code}")
+
 
 # ── Footer ────────────────────────────────────────────────────────────────────
 st.divider()

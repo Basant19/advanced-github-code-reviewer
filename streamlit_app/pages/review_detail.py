@@ -1,3 +1,4 @@
+#E:\advanced-github-code-reviewer\streamlit_app\pages\review_detail.py
 import os
 import requests
 import streamlit as st
@@ -40,12 +41,13 @@ def _api(method: str, path: str, **kwargs):
     url = f"{API_BASE}{path}"
     try:
         resp = getattr(requests, method)(url, timeout=15, **kwargs)
-        if resp.status_code == 404:
-            return None, f"❌ 404 Not Found: `{url}`"
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            # Return the status code in the error string so we can detect 409
+            return None, f"HTTP {resp.status_code}: {resp.text}"
         return resp.json(), None
     except Exception as e:
         return None, f"Communication Error: {e}"
+
 
 def _status_badge(status: str) -> str:
     badges = {
@@ -115,30 +117,54 @@ with top_c3:
 st.divider()
 
 # ── HITL Decision Panel ───────────────────────────────────────────────────────
+# In review_detail.py — update the HITL section
 if status_str == "pending_hitl":
     with st.container(border=True):
         st.subheader("🟡 Action Required: Human-in-the-Loop")
-        st.write("The AI has finished its analysis. Review the findings below and provide a decision.")
-        
+        st.write("The AI has finished its analysis. Review the findings and provide a decision.")
+
         c_app, c_rej = st.columns(2)
+
         with c_app:
             if st.button("✅ Approve & Post to GitHub", type="primary", use_container_width=True):
                 with st.spinner("Submitting approval..."):
-                    _, err = _api("post", f"/reviews/id/{review_id}/decision", json={"decision": "approved"})
-                    if not err: 
-                        st.success("Review Approved! Syncing with GitHub...")
+                    result, err = _api(
+                        "post", f"/reviews/id/{review_id}/decision",
+                        json={"decision": "approved"}
+                    )
+                    if not err:
+                        st.success("Approved! GitHub comment posted.")
                         time.sleep(1.5)
                         st.rerun()
-                    else: st.error(err)
+                    elif "409" in str(err):
+                        st.error(
+                            "⚠️ **Cannot resume this review.**\n\n"
+                            "Graph checkpoint not found — this review was created "
+                            "before Postgres persistence was enabled.\n\n"
+                            "**→ Trigger a new review from the dashboard.**"
+                        )
+                    else:
+                        st.error(err)
+
         with c_rej:
             if st.button("❌ Reject (Internal Only)", use_container_width=True):
                 with st.spinner("Rejecting..."):
-                    _, err = _api("post", f"/reviews/id/{review_id}/decision", json={"decision": "rejected"})
-                    if not err: 
-                        st.warning("Review Rejected.")
+                    result, err = _api(
+                        "post", f"/reviews/id/{review_id}/decision",
+                        json={"decision": "rejected"}
+                    )
+                    if not err:
+                        st.warning("Review rejected.")
                         time.sleep(1.5)
                         st.rerun()
-                    else: st.error(err)
+                    elif "409" in str(err):
+                        st.error(
+                            "⚠️ **Cannot resume this review.** "
+                            "Checkpoint lost — trigger a new review."
+                        )
+                    else:
+                        st.error(err)
+                        
 
 # ── Content Tabs ──────────────────────────────────────────────────────────────
 tab_findings, tab_diff, tab_steps = st.tabs(["🔴 AI Findings", "📄 Diff", "📑 Audit Trail"])

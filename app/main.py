@@ -1,13 +1,12 @@
 """
 app/main.py — P4 Production
-FastAPI application. PostgreSQL tables + AsyncPostgresSaver initialized on startup.
-
-Run via: python run.py  (NOT uvicorn app.main:app directly)
-The run.py entry point sets WindowsSelectorEventLoopPolicy before uvicorn starts.
+FastAPI app with lifespan-managed startup.
+Run via: python run.py
 """
 
 import time
 import traceback
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Depends, Request, HTTPException
 from fastapi.responses import JSONResponse
@@ -20,14 +19,78 @@ from app.db.base import Base
 from app.db.session import engine
 from app.api.deps import get_db
 
-# Routers imported at module level — safe because run.py sets the event
-# loop policy before uvicorn imports this file.
-from app.api.routes import webhook, review, chat
-from app.api.routes.hitl import router as hitl_router
-from app.api.routes.repos import router as repos_router
-from app.services.review_service import list_all_reviews
-
 logger = get_logger(__name__)
+
+
+# ── Lifespan ──────────────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Startup/shutdown lifecycle manager.
+
+    Startup order is strict — no requests are served until both phases complete.
+    Phase 1: SQLAlchemy ORM tables (asyncpg driver). Fatal on failure.
+    Phase 2: AsyncPostgresSaver (psycopg3 driver). Fatal on failure.
+
+    Using lifespan instead of @app.on_event("startup") guarantees that
+    init_checkpointer() runs BEFORE the first request — there is no window
+    where get_review_graph() can return a MemorySaver-backed graph at
+    request time.
+    """
+    logger.info("[startup] Starting Advanced GitHub Code Reviewer P4 — version=4.0.0")
+
+    # ── Phase 1: SQLAlchemy ORM tables ───────────────────────────────────────
+    try:
+        logger.info("[startup] Phase 1 — initializing SQLAlchemy ORM tables")
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        logger.info("[startup] Phase 1 complete — database schema ready")
+    except Exception as e:
+        logger.exception("[startup] Phase 1 FAILED — cannot connect to database: %s", str(e))
+        raise RuntimeError(f"Database initialization failed: {e}") from e
+
+    # ── Phase 2: LangGraph AsyncPostgresSaver ─────────────────────────────────
+    # Imported here to avoid triggering module-level graph construction
+    # before the event loop policy is active.
+    try:
+        from app.graph.workflow import init_checkpointer
+
+        checkpointer_url = settings.CHECKPOINTER_DB_URL or ""
+        if not checkpointer_url:
+            raise RuntimeError(
+                "CHECKPOINTER_DB_URL is not set in .env. "
+                "AsyncPostgresSaver requires a psycopg3 connection string. "
+                "Example: postgresql://user:pass@localhost:5432/dbname"
+            )
+
+        display = checkpointer_url.split("@")[-1] if "@" in checkpointer_url else checkpointer_url
+        logger.info("[startup] Phase 2 — initializing AsyncPostgresSaver — %s", display)
+        await init_checkpointer(checkpointer_url)
+
+    except RuntimeError:
+        raise  # propagate config errors immediately
+    except Exception as e:
+        logger.exception("[startup] Phase 2 FAILED — %s", str(e))
+        raise RuntimeError(f"AsyncPostgresSaver initialization failed: {e}") from e
+
+    # ── Ready ─────────────────────────────────────────────────────────────────
+    logger.info(
+        "[startup] Configuration — environment=%s db=%s checkpointer_db=%s langsmith=%s",
+        settings.ENVIRONMENT,
+        bool(settings.DATABASE_URL),
+        bool(settings.CHECKPOINTER_DB_URL),
+        settings.LANGSMITH_TRACING,
+    )
+    logger.info("[startup] Application startup complete — serving requests")
+
+    yield  # server is live here
+
+    # ── Shutdown ──────────────────────────────────────────────────────────────
+    logger.info("[shutdown] Application shutting down")
+
+
+# ── Application ───────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="Advanced GitHub Code Reviewer",
@@ -42,6 +105,7 @@ app = FastAPI(
         "2. Trigger reviews — context injected automatically"
     ),
     version="4.0.0",
+    lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
 )
@@ -52,94 +116,50 @@ app = FastAPI(
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     start = time.time()
-    logger.info(
-        "[REQUEST] %s %s — client=%s",
-        request.method, request.url.path,
-        request.client.host if request.client else "unknown",
-    )
+    logger.info("[REQUEST] %s %s — client=%s",
+                request.method, request.url.path,
+                request.client.host if request.client else "unknown")
     try:
         response = await call_next(request)
-        logger.info(
-            "[RESPONSE] %s %s → %d (%sms)",
-            request.method, request.url.path,
-            response.status_code,
-            round((time.time() - start) * 1000, 2),
-        )
+        logger.info("[RESPONSE] %s %s → %d (%sms)",
+                    request.method, request.url.path,
+                    response.status_code,
+                    round((time.time() - start) * 1000, 2))
         return response
     except Exception as e:
         logger.exception("[CRASH] %s %s — %s", request.method, request.url.path, str(e))
         raise
 
 
-# ── Startup ───────────────────────────────────────────────────────────────────
-
-@app.on_event("startup")
-async def on_startup() -> None:
-    """
-    Two-phase startup:
-
-    Phase 1 — SQLAlchemy (asyncpg): create ORM tables. Fatal on failure.
-    Phase 2 — AsyncPostgresSaver (psycopg3): create checkpoint tables,
-              open pool, build graph. Falls back to MemorySaver on failure.
-
-    This runs AFTER the event loop is created. By the time this executes,
-    run.py has already set WindowsSelectorEventLoopPolicy, so psycopg3
-    can create async connections successfully.
-    """
-    logger.info("[startup] Starting Advanced GitHub Code Reviewer P4 — version=4.0.0")
-
-    # ── Phase 1: SQLAlchemy ORM tables ───────────────────────────────────────
-    try:
-        logger.info("[startup] Phase 1 — initializing SQLAlchemy ORM tables")
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-        logger.info("[startup] Phase 1 complete — database schema ready")
-
-    except Exception as e:
-        logger.exception("[startup] Phase 1 FAILED — %s", str(e))
-        raise RuntimeError(f"Database initialization failed: {e}") from e
-
-    # ── Phase 2: LangGraph AsyncPostgresSaver ─────────────────────────────────
-    try:
-        from app.graph.workflow import init_checkpointer
-
-        checkpointer_url = settings.CHECKPOINTER_DB_URL or ""
-
-        if not checkpointer_url:
-            logger.warning(
-                "[startup] CHECKPOINTER_DB_URL not set — MemorySaver fallback. "
-                "Checkpoints will not survive restarts."
-            )
-            await init_checkpointer("")
-        else:
-            display = checkpointer_url.split("@")[-1] if "@" in checkpointer_url else checkpointer_url
-            logger.info("[startup] Phase 2 — initializing AsyncPostgresSaver — %s", display)
-            await init_checkpointer(checkpointer_url)
-
-    except Exception as e:
-        logger.exception("[startup] Phase 2 unexpected failure — %s", str(e))
-
-    # ── Summary ───────────────────────────────────────────────────────────────
-    logger.info(
-        "[startup] Configuration — environment=%s db=%s checkpointer_db=%s langsmith=%s",
-        settings.ENVIRONMENT,
-        bool(settings.DATABASE_URL),
-        bool(settings.CHECKPOINTER_DB_URL),
-        settings.LANGSMITH_TRACING,
-    )
-    logger.info("[startup] Application startup complete")
-
-
 # ── Exception Handlers ────────────────────────────────────────────────────────
 
 @app.exception_handler(CustomException)
 async def custom_exception_handler(request: Request, exc: CustomException) -> JSONResponse:
-    logger.error("[exception_handler] CustomException on %s — %s", request.url.path, str(exc))
+    logger.error(
+        "[exception_handler] CustomException on %s — %s",
+        request.url.path, str(exc),
+    )
     return JSONResponse(status_code=500, content={"detail": str(exc)})
 
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    # RuntimeError "Caught handled exception, but response already started"
+    # means a middleware or streaming response already sent headers.
+    # Log it but don't try to send another response — that would crash.
+    error_msg = str(exc)
+    if "response already started" in error_msg.lower():
+        logger.warning(
+            "[exception_handler] Response already started on %s — "
+            "cannot send error response. Original error: %s",
+            request.url.path, error_msg,
+        )
+        # Cannot send a new response — just return to avoid double-send crash
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Internal Server Error"},
+        )
+
     logger.error(
         "[exception_handler] Unhandled %s on %s — %s",
         type(exc).__name__, request.url.path, str(exc),
@@ -148,7 +168,13 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
     return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
 
 
+
 # ── Routers ───────────────────────────────────────────────────────────────────
+
+from app.api.routes import webhook, review, chat          # noqa: E402
+from app.api.routes.hitl import router as hitl_router     # noqa: E402
+from app.api.routes.repos import router as repos_router   # noqa: E402
+from app.services.review_service import list_all_reviews  # noqa: E402
 
 app.include_router(webhook.router)
 app.include_router(review.router)
@@ -156,9 +182,7 @@ app.include_router(chat.router)
 app.include_router(hitl_router)
 app.include_router(repos_router)
 
-logger.info(
-    "[startup] Routers registered — /webhook, /reviews, /chat, /reviews (HITL), /repos (P4 RAG)"
-)
+logger.info("[startup] Routers registered — /webhook, /reviews, /chat, /reviews (HITL), /repos (P4 RAG)")
 
 
 # ── Dashboard Endpoint ────────────────────────────────────────────────────────

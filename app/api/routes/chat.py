@@ -156,15 +156,18 @@ async def send_message(
         "Returns 404 if thread does not exist."
     ),
 )
+
+@router.get("/{thread_id}/messages", response_model=ThreadMessagesResponse)
 async def get_messages(
     thread_id: str,
-    db:        AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
 ) -> ThreadMessagesResponse:
     """Fetch full message history for a thread."""
     logger.info("[chat_route] Get messages — thread_id=%s", thread_id)
 
     try:
-        service  = ChatService(db)
+        service = ChatService(db)
+        # Call the METHOD on the service instance
         messages = await service.get_thread_messages(thread_id=thread_id)
 
         return ThreadMessagesResponse(
@@ -183,8 +186,17 @@ async def get_messages(
         )
 
     except CustomException as e:
+        msg = str(e).lower()
+        # FIX: If thread doesn't exist, return empty list instead of 404/500
+        if "not found" in msg:
+            logger.info("[chat_route] Thread not found — returning empty state")
+            return ThreadMessagesResponse(
+                thread_id=thread_id,
+                message_count=0,
+                messages=[]
+            )
+        # For other service errors, use your standard handler
         _handle_error(e, "get_messages")
-
 
 @router.delete(
     "/{thread_id}",

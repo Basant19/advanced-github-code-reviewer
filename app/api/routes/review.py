@@ -170,26 +170,8 @@ class TriggerReviewResponse(BaseModel):
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-
 def _handle_service_error(e: Exception, context: str) -> NoReturn:
-    """
-    Map service layer exceptions to appropriate HTTP responses.
-
-    Called from every route's except block. Logs the error with context
-    then raises HTTPException with the correct status code.
-
-    Parameters
-    ----------
-    e : Exception
-        Exception from service layer.
-    context : str
-        Route function name — included in log for traceability.
-
-    Raises
-    ------
-    HTTPException
-        Always raises — return type is NoReturn.
-    """
+    """Map service exceptions to HTTP responses."""
     logger.error(
         "[review_route] Error in %s — type=%s message=%s",
         context, type(e).__name__, str(e),
@@ -204,20 +186,20 @@ def _handle_service_error(e: Exception, context: str) -> NoReturn:
                 status_code=http_status.HTTP_404_NOT_FOUND,
                 detail=str(e),
             )
-
         if "invalid" in msg or "not in hitl" in msg or "pending" in msg:
             raise HTTPException(
                 status_code=http_status.HTTP_400_BAD_REQUEST,
                 detail=str(e),
             )
-
-        if "checkpoint" in msg or "corrupted" in msg:
+        if "state not found" in msg or "cannot resume" in msg or "checkpoint" in msg:
             raise HTTPException(
                 status_code=http_status.HTTP_409_CONFLICT,
-                detail="Graph state is corrupted or missing. "
-                       "Trigger a new review.",
+                detail=(
+                    "Graph checkpoint not found. "
+                    "This review was created before Postgres persistence was enabled. "
+                    "Please trigger a new review."
+                ),
             )
-
         raise HTTPException(
             status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(e),
@@ -227,6 +209,8 @@ def _handle_service_error(e: Exception, context: str) -> NoReturn:
         status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
         detail="An internal server error occurred.",
     )
+
+
 
 
 def _safe_parse_json(data: Any) -> Any:
@@ -363,7 +347,6 @@ async def list_repo_reviews(
     except Exception as e:
         _handle_service_error(e, "list_repo_reviews")
 
-
 @router.get(
     "/id/{review_id}",
     response_model=ReviewDetailResponse,
@@ -373,12 +356,7 @@ async def get_review_details(
     review_id: int = Path(..., gt=0, description="Review ID"),
     db: AsyncSession = Depends(get_db),
 ) -> ReviewDetailResponse:
-    """
-    Fetch a single review by ID including all ReviewStep records.
-
-    ReviewStep.output_data is parsed from JSON text back to dict/list
-    before returning to prevent the client receiving raw JSON strings.
-    """
+    """Fetch a single review by ID with all ReviewStep records."""
     logger.info("[review_route] Get review — id=%d", review_id)
 
     try:
@@ -390,8 +368,11 @@ async def get_review_details(
 
         return review
 
+    except HTTPException:
+        raise  # already formatted, don't re-wrap
     except Exception as e:
         _handle_service_error(e, "get_review_details")
+
 
 
 @router.post(
@@ -405,18 +386,18 @@ async def get_review_details(
         "Rejected reviews produce HUMAN_REJECTED verdict with no GitHub comment."
     ),
 )
+
+@router.post(
+    "/id/{review_id}/decision",
+    response_model=ReviewResponse,
+    summary="Submit human decision (approve or reject)",
+)
 async def submit_human_decision(
     review_id: int = Path(..., gt=0, description="Review ID"),
     request: ReviewDecisionRequest = None,
     db: AsyncSession = Depends(get_db),
 ) -> ReviewResponse:
-    """
-    Submit a human decision to resume a pending_hitl review.
-
-    This is the primary HITL endpoint. The decision is injected into
-    the LangGraph checkpoint via Command(resume=decision), which causes
-    hitl_node to receive it via interrupt() return value.
-    """
+    """Resume a pending_hitl review with human decision."""
     logger.info(
         "[review_route] HITL decision — review_id=%d decision=%s",
         review_id, request.decision,
@@ -437,5 +418,7 @@ async def submit_human_decision(
 
         return review
 
+    except HTTPException:
+        raise
     except Exception as e:
         _handle_service_error(e, "submit_human_decision")
