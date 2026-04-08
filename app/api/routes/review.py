@@ -75,7 +75,7 @@ router = APIRouter(prefix="/reviews", tags=["reviews"])
 
 # ── Request / Response Schemas ────────────────────────────────────────────────
 
-class TriggerReviewRequest(BaseModel):
+class TriggerReviewRequest(BaseModel): 
     """
     Request body for POST /reviews/trigger.
 
@@ -152,11 +152,10 @@ class ReviewResponse(BaseModel):
 
 
 class ReviewDetailResponse(ReviewResponse):
-    """
-    Full review response — includes ReviewStep execution history.
-    Used by GET /reviews/id/{review_id}.
-    """
-    steps: List[ReviewStepResponse] = []
+    """Full review response including steps, issues, and suggestions."""
+    steps:       List[ReviewStepResponse] = []
+    issues:      List[str] = []
+    suggestions: List[str] = []
 
 
 class TriggerReviewResponse(BaseModel):
@@ -209,8 +208,6 @@ def _handle_service_error(e: Exception, context: str) -> NoReturn:
         status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
         detail="An internal server error occurred.",
     )
-
-
 
 
 def _safe_parse_json(data: Any) -> Any:
@@ -352,24 +349,59 @@ async def list_repo_reviews(
     response_model=ReviewDetailResponse,
     summary="Get a single review with execution steps",
 )
+
+@router.get("/id/{review_id}", response_model=ReviewDetailResponse)
 async def get_review_details(
-    review_id: int = Path(..., gt=0, description="Review ID"),
+    review_id: int = Path(..., gt=0),
     db: AsyncSession = Depends(get_db),
 ) -> ReviewDetailResponse:
-    """Fetch a single review by ID with all ReviewStep records."""
     logger.info("[review_route] Get review — id=%d", review_id)
 
     try:
         review = await get_review(review_id, db)
 
-        # Parse output_data from JSON string to dict/list
+        issues = []
+        suggestions_list = []
+
         for step in review.steps:
             step.output_data = _safe_parse_json(step.output_data)
+            if step.step_name == "analyze_code" and isinstance(step.output_data, list):
+                issues = step.output_data
 
-        return review
+        summary_text = review.summary or ""
+        in_suggestions = False
+        for line in summary_text.splitlines():
+            if "💡 Suggestions" in line:
+                in_suggestions = True
+                continue
+            if in_suggestions and line.startswith("- "):
+                suggestions_list.append(line[2:].strip())
+            elif in_suggestions and line.startswith("#"):
+                in_suggestions = False
+
+        # Build response explicitly — avoids SQLAlchemy lazy-load
+        # serialization errors that cause "response already started"
+        return ReviewDetailResponse(
+            id=review.id,
+            status=review.status,
+            verdict=review.verdict,
+            summary=review.summary,
+            created_at=review.created_at,
+            steps=[
+                ReviewStepResponse(
+                    id=s.id,
+                    step_name=s.step_name,
+                    status=s.status,
+                    output_data=s.output_data,
+                )
+                for s in review.steps
+            ],
+            issues=issues,
+            suggestions=suggestions_list,
+        )
 
     except HTTPException:
-        raise  # already formatted, don't re-wrap
+        raise
     except Exception as e:
         _handle_service_error(e, "get_review_details")
 

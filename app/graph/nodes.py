@@ -605,39 +605,38 @@ def _validate_patch_syntax(patch: str) -> Tuple[bool, str]:
 
 # ── Output Parser ─────────────────────────────────────────────────────────────
 
-def _parse_llm_output(raw: str) -> Tuple[List[str], List[str]]:
+def _parse_llm_output(text: str) -> tuple[list[str], list[str]]:
     """
-    Parse structured ISSUES / SUGGESTIONS sections from LLM response.
-
-    Expected format:
-        ISSUES:
-        - issue one
-
-        SUGGESTIONS:
-        - suggestion one
-
-    Returns (issues, suggestions) — both may be empty lists.
+    Parses the structured LLM output into two lists.
+    Handles the 'ISSUES:' and 'SUGGESTIONS:' sections.
     """
-    issues: List[str] = []
-    suggestions: List[str] = []
-    section = None
+    issues = []
+    suggestions = []
+    current_section = None
 
-    for line in raw.splitlines():
+    for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
-        if line.upper().startswith("ISSUES"):
-            section = "issues"
-        elif line.upper().startswith("SUGGESTIONS"):
-            section = "suggestions"
-        elif line.startswith("-"):
-            item = line.lstrip("- ").strip()
-            if not item or item.lower() == "none":
+
+        # Detect Section
+        if line.upper().startswith("ISSUES:"):
+            current_section = "issues"
+            continue
+        elif line.upper().startswith("SUGGESTIONS:"):
+            current_section = "suggestions"
+            continue
+
+        # Collect bullet points
+        if line.startswith("- "):
+            content = line[2:].strip()
+            if content.upper() == "NONE":
                 continue
-            if section == "issues":
-                issues.append(item)
-            elif section == "suggestions":
-                suggestions.append(item)
+                
+            if current_section == "issues":
+                issues.append(content)
+            elif current_section == "suggestions":
+                suggestions.append(content)
 
     return issues, suggestions
 
@@ -926,15 +925,21 @@ async def analyze_code_node(state: ReviewState) -> Dict:
 
     prompt = [
         SystemMessage(content=(
-            "You are an expert code reviewer. Analyze the PR diff below and "
-            "provide structured, actionable feedback.\n\n"
-            "Respond in EXACTLY this format:\n\n"
-            "ISSUES:\n- <issue 1>\n- <issue 2>\n"
-            "(or '- None' if no issues)\n\n"
-            "SUGGESTIONS:\n- <suggestion 1>\n"
-            "(or '- None' if no suggestions)\n\n"
-            "Be specific. Reference filenames and line context where possible."
-        )),
+            "You are an expert Python Security and Logic Auditor. "
+        "Do not stop after finding a syntax error. Analyze the code in two layers:\n\n"
+        
+        "LAYER 1: LOGIC & TYPE SAFETY (Priority High)\n"
+        "- Look for operations that will fail at runtime even if syntax is fixed.\n"
+        "- Example: If a variable is cast to str() but used in division (/), flag it as a TYPE ERROR.\n"
+        "- Pay attention to comments like '# Intentional Bug'—if a comment says it's a bug, list it as an ISSUE.\n\n"
+        
+        "LAYER 2: SYNTAX & FORMATTING\n"
+        "- Identify trailing periods, missing colons, or indentation errors.\n\n"
+        
+        "CRITICAL RULE: If a line has a syntax error AND a logic error (like line 4 in calculator.py), "
+        "you MUST list BOTH as separate bullet points in the ISSUES section."
+
+        )), 
         HumanMessage(content=(
             f"PR Title: {pr_title}"
             f"{context_section}"

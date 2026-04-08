@@ -170,31 +170,51 @@ if status_str == "pending_hitl":
 tab_findings, tab_diff, tab_steps = st.tabs(["🔴 AI Findings", "📄 Diff", "📑 Audit Trail"])
 
 with tab_findings:
-    st.markdown(f"### Summary")
-    st.write(review.get("summary") or "No summary available yet.")
-    
+    st.markdown("### Summary")
+    st.markdown(review.get("summary") or "No summary available yet.")
+    st.divider()
+
     col_iss, col_sug = st.columns(2)
+
     with col_iss:
         st.markdown("### ⚠️ Critical Issues")
         issues = review.get("issues") or []
-        if not issues: 
+        if not issues:
             st.success("No critical issues found.")
         else:
-            for issue in issues: 
+            for issue in issues:
                 st.error(issue)
-        
+
     with col_sug:
         st.markdown("### 💡 Suggestions")
         suggestions = review.get("suggestions") or []
-        if not suggestions: 
+        if not suggestions:
             st.caption("No logic suggestions provided.")
         else:
-            for sug in suggestions: 
+            for sug in suggestions:
                 st.info(sug)
 
 with tab_diff:
-    diff_content = review.get("diff", "No diff available.")
-    st.code(diff_content, language="diff")
+    # diff is not a top-level field on the review response.
+    # It's stored in the fetch_diff audit step as output_data.content.
+    diff_content = review.get("diff")  # will be None
+
+    if not diff_content:
+        steps = review.get("steps", [])
+        for step in steps:
+            if step.get("step_name") == "fetch_diff":
+                output = step.get("output_data", {})
+                if isinstance(output, dict):
+                    diff_content = output.get("content", "")
+                elif isinstance(output, str):
+                    diff_content = output
+                break
+
+    if diff_content:
+        st.code(diff_content, language="diff")
+    else:
+        st.info("No diff available — trigger a new review to capture diff data.")
+
 
 with tab_steps:
     st.write("### Workflow Execution Steps")
