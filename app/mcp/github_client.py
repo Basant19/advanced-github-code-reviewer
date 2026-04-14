@@ -21,10 +21,10 @@ ENV REQUIREMENT:
 """
 
 import sys
-from typing import List, Dict
-
+from typing import List, Dict, Optional
+import httpx
 from github import Github, GithubException
-
+import requests
 from app.core.config import settings
 from app.core.exceptions import CustomException
 from app.core.logger import get_logger
@@ -42,30 +42,28 @@ MAX_DIFF_SIZE = 20000  # prevent extremely large LLM input
 # ─────────────────────────────────────────────
 # CLIENT
 # ─────────────────────────────────────────────
-
 class GitHubClient:
-    """
-    Wrapper around PyGithub with:
-    - Consistent logging
-    - Controlled exceptions
-    - Clean API surface for graph nodes
-    """
-
     def __init__(self) -> None:
         try:
             if not settings.github_token:
                 raise ValueError("Missing GitHub token")
-
-            self.client = Github(settings.github_token)
-
-            logger.info(
-                "[GitHubClient] Initialized successfully",
-                extra={"auth": "token_present"},
+            
+            self._token = settings.github_token
+            self.client = Github(self._token)
+            # We'll use a persistent async client for better performance
+            self.async_client = httpx.AsyncClient(
+                headers={
+                    "Authorization": f"token {self._token}",
+                    "Accept": "application/vnd.github.raw",
+                },
+                timeout=10.0
             )
 
+            logger.info("[GitHubClient] Initialized successfully")
         except Exception as e:
             logger.exception("[GitHubClient] Initialization failed")
             raise CustomException("GitHub client initialization failed", sys) from e
+
 
     # ─────────────────────────────────────────
     # INTERNAL HELPERS
@@ -139,40 +137,41 @@ class GitHubClient:
     # ─────────────────────────────────────────
 
     def get_pr_metadata(self, owner: str, repo: str, pr_number: int) -> Dict:
-        """
-        Fetch PR metadata for context.
-
-        Returns:
-            dict
-        """
-        logger.info(
-            "[GitHub] Fetching PR metadata",
-            extra={"repo": f"{owner}/{repo}", "pr": pr_number},
-        )
-
-        try:
-            pr = self._get_pr(owner, repo, pr_number)
-
-            metadata = {
-                "number": pr.number,
-                "title": pr.title or "",
-                "author": getattr(pr.user, "login", "unknown"),
-                "description": pr.body or "",
-                "base_branch": pr.base.ref,
-                "head_branch": pr.head.ref,
-                "state": "merged" if pr.merged else pr.state,
-            }
-
-            logger.debug(
-                "[GitHub] Metadata fetched",
-                extra={"title": metadata["title"]},
+            """
+            Fetch PR metadata for context.
+            """
+            logger.info(
+                "[GitHub] Fetching PR metadata",
+                extra={"repo": f"{owner}/{repo}", "pr": pr_number},
             )
 
-            return metadata
+            try:
+                # This is the object we use
+                pr = self._get_pr(owner, repo, pr_number)
 
-        except Exception as e:
-            logger.exception("[GitHub] Metadata fetch failed")
-            raise CustomException("Failed to fetch PR metadata", sys) from e
+                metadata = {
+                    "number": pr.number,
+                    "title": pr.title or "",
+                    "author": getattr(pr.user, "login", "unknown"),
+                    "description": pr.body or "",
+                    "base_branch": pr.base.ref,
+                    "head_branch": pr.head.ref,
+                    # Accessing SHAs via the PyGithub 'pr' object:
+                    "base_sha": pr.base.sha,  
+                    "head_sha": pr.head.sha,
+                    "state": "merged" if pr.merged else pr.state,
+                }
+
+                logger.debug(
+                    "[GitHub] Metadata fetched",
+                    extra={"title": metadata["title"]},
+                )
+
+                return metadata
+
+            except Exception as e:
+                logger.exception("[GitHub] Metadata fetch failed")
+                raise CustomException("Failed to fetch PR metadata", sys) from e
 
     # ─────────────────────────────────────────
 
@@ -262,6 +261,29 @@ class GitHubClient:
         except Exception as e:
             logger.exception("[GitHub] Diff build failed")
             raise CustomException("Failed to build PR diff", sys) from e
+    #----------------------------------------------------------------------------
+
+    async def get_file_content(self, url: str) -> Optional[str]:
+            """
+            Fetch raw file content asynchronously. 
+            Crucial for not blocking the FastAPI event loop during graph execution.
+            """
+            try:
+                response = await self.async_client.get(url)
+
+                if response.status_code == 200:
+                    logger.info("[GitHubClient] File content fetched — %d chars", len(response.text))
+                    return response.text
+
+                logger.warning(
+                    "[GitHubClient] Content fetch failed — status=%d url=%s",
+                    response.status_code, url[:80],
+                )
+                return None
+
+            except Exception as e:
+                logger.warning("[GitHubClient] get_file_content error — %s", str(e))
+                return None
 
     # ─────────────────────────────────────────
 
@@ -310,3 +332,41 @@ class GitHubClient:
         except Exception as e:
             logger.exception("[GitHub] Unexpected comment error")
             raise CustomException("Unexpected GitHub error", sys) from e
+
+
+    async def get_base_file_content(
+        self,
+        owner: str,
+        repo: str,
+        filepath: str,
+        base_sha: str,
+    ) -> Optional[str]:
+        """
+        Fetch a file's content asynchronously using the existing httpx async_client.
+        """
+        try:
+            url = f"https://api.github.com/repos/{owner}/{repo}/contents/{filepath}"
+            params = {"ref": base_sha}
+
+            # Use the persistent async_client instead of requests
+            response = await self.async_client.get(url, params=params)
+
+            if response.status_code == 200:
+                logger.info(
+                    "[GitHubClient] Base file fetched — %s@%s (%d chars)",
+                    filepath, base_sha[:8], len(response.text),
+                )
+                return response.text
+
+            logger.warning(
+                "[GitHubClient] Base file fetch failed — %s status=%d",
+                filepath, response.status_code,
+            )
+            return None
+
+        except Exception as e:
+            logger.warning(
+                "[GitHubClient] get_base_file_content error — %s: %s",
+                filepath, str(e),
+            )
+            return None

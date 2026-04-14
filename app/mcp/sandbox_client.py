@@ -25,6 +25,10 @@ class ParseError(CustomException):
     """Raised when the unified diff cannot be parsed."""
     pass
 
+class SandboxRuntimeError(CustomException):
+    """Raised when the Docker execution fails fundamentally."""
+    pass
+
 
 # ---------------------------------------------------------------------------
 # SandboxClient
@@ -39,218 +43,136 @@ class SandboxClient:
     # ──────────────────────────────────────────────────────────
 
     def run_lint(self, diff: str) -> SandboxResult:
-        logger.info("sandbox_client: Starting lint run")
+        """
+        CRITICAL FIX: Processes a PR diff and runs linting inside the sandbox.
+        This resolves the AttributeError in nodes.py.
+        """
+        logger.info("sandbox_client: Starting lint run (type=diff)")
+        
+        try:
+            # 1. Parse the diff into file mapping
+            files = self._parse_diff(diff)
+            if not files:
+                logger.warning("sandbox_client: No files extracted from diff, skipping sandbox.")
+                return SandboxResult(passed=True, output="No python files to lint", tool="lint")
 
-        # 🔍 RAW DIFF DEBUG (CRITICAL)
-        logger.debug(f"[sandbox_debug] RAW DIFF PREVIEW:\n{diff[:1000]}")
+            # 2. Log payload for observability
+            self._log_payload(files, "LINT")
 
-        files = self._parse_diff(diff)
+            # 3. Execute in Docker
+            result = self._runner.run(files=files, run_type=RunType.LINT)
+            
+            logger.info(
+                "sandbox_client: Lint complete — %s exit_code=%d duration=%dms",
+                "[LINT PASSED]" if result.passed else "[LINT FAILED]",
+                result.exit_code,
+                result.duration_ms,
+            )
+            return result
 
-        # 🔍 Payload snapshot
-        self._log_payload(files, "LINT")
+        except Exception as exc:
+            logger.exception("sandbox_client: run_lint encountered a fatal error")
+            # Return a failed result to ensure the graph knows the sandbox didn't verify the code
+            return SandboxResult(
+                passed=False, 
+                output="", 
+                errors=f"Sandbox execution failed: {str(exc)}",
+                exit_code=1,
+                tool="lint"
+            )
 
-        result = self._runner.run(files=files, run_type=RunType.LINT)
+    def run_lint_raw(self, filename: str, content: str) -> SandboxResult:
+        logger.info("sandbox_client: Starting lint run (type=raw)")
+        files = {filename: content}
 
-        logger.info(f"sandbox_client: Lint complete — {result.summary}")
-        return result
+        try:
+            # If your DockerRunner uses Ruff/Flake8, it won't catch 'a / str(b)'.
+            # Consider adding a type-checker like 'mypy' to the Docker image 
+            # specifically for raw analysis.
+            result = self._runner.run(files=files, run_type=RunType.LINT)
+            return result
+        except Exception as exc:
+            logger.exception("[sandbox_debug] run_lint_raw failed for %s", filename)
+            return SandboxResult(
+                passed=False, # CHANGED: Fail closed so the system knows baseline is unverified
+                output="",
+                errors=f"Baseline check failed: {str(exc)}",
+                exit_code=1,
+                tool="lint",
+            )
 
     def run_tests(self, patch: str) -> SandboxResult:
+        """Runs tests by applying a patch/diff."""
         logger.info("sandbox_client: Starting test run")
-
-        # 🔍 RAW PATCH DEBUG
-        logger.debug(f"[sandbox_debug] RAW PATCH PREVIEW:\n{patch[:1000]}")
-
-        files = self._parse_diff(patch)
-
-        # 🔍 Payload snapshot
-        self._log_payload(files, "TEST")
-
-        result = self._runner.run(files=files, run_type=RunType.TEST)
-
-        logger.info(f"sandbox_client: Test run complete — {result.summary}")
-        return result
+        try:
+            files = self._parse_diff(patch)
+            self._log_payload(files, "TEST")
+            result = self._runner.run(files=files, run_type=RunType.TEST)
+            logger.info(f"sandbox_client: Test run complete — {result.summary}")
+            return result
+        except Exception as exc:
+            logger.exception("sandbox_client: run_tests failed")
+            return SandboxResult(passed=False, errors=str(exc), tool="test")
 
     def is_available(self) -> bool:
         return self._runner.is_available()
 
     # ──────────────────────────────────────────────────────────
-    # DEBUG HELPERS
+    # INTERNAL HELPERS
     # ──────────────────────────────────────────────────────────
 
     def _log_payload(self, files: dict[str, str], context: str) -> None:
-        """Log exactly what is sent to Docker."""
-        if not files:
-            logger.warning(f"[sandbox_debug] {context} payload is EMPTY")
-            return
-
         logger.info(f"[sandbox_debug] Sending {len(files)} file(s) to Docker for {context}")
-
         for filename, content in files.items():
             logger.info(f"  -> {filename} ({len(content)} chars)")
-            logger.debug(
-                f"[sandbox_debug] CONTENT PREVIEW ({filename}):\n{content[:300]}"
-            )
-
-    # ──────────────────────────────────────────────────────────
-    # DIFF PARSER
-    # ──────────────────────────────────────────────────────────
 
     def _parse_diff(self, diff: str) -> dict[str, str]:
-        """
-        Production-grade unified diff parser
-
-        Handles:
-        ✔ Standard Git diff (+++ b/file.py)
-        ✔ GitHub simplified diff (--- file.py (modified))
-        ✔ New files (/dev/null → file.py)
-        ✔ Deleted files (skipped safely)
-        ✔ Simplified diffs (no context lines)
-        ✔ Silent parsing failures (logged)
-
-        Returns:
-            dict[str, str] → {filename: reconstructed_content}
-        """
-
         if not diff or not diff.strip():
-            logger.warning("[parse_diff]  Empty diff received")
             return {}
 
         files: dict[str, str] = {}
         current_file: Optional[str] = None
         current_lines: list[str] = []
 
-        # ─────────────────────────────────────────────
-        # Patterns
-        # ─────────────────────────────────────────────
         plus_plus_re = re.compile(r"^\+\+\+\s+(?:[abciw][\\/])?([^\s]+)")
         modified_re = re.compile(r"^---\s+([^\s]+)\s+\(modified\)")
-        new_file_re = re.compile(r"^\+\+\+\s+(?:[abciw][\\/])?(.+)")  # for new files
-
-        skipped_files = 0
-        detected_files = 0
-
-        logger.info("[parse_diff] 🚀 START parsing")
-        logger.debug(f"[parse_diff] Diff preview (first 500 chars):\n{diff[:500]}")
 
         try:
-            lines = diff.splitlines()
-
-            for idx, line in enumerate(lines):
-
-                # ─────────────────────────────
-                # 1. Detect file headers
-                # ─────────────────────────────
-                plus_match = plus_plus_re.match(line)
-                mod_match = modified_re.match(line)
-
-                match = plus_match or mod_match
+            for line in diff.splitlines():
+                match = plus_plus_re.match(line) or modified_re.match(line)
 
                 if match:
+                    # Save previous file buffer
+                    if current_file and current_lines:
+                        files[current_file] = "\n".join(current_lines).strip()
+
                     new_path = match.group(1).replace("\\", "/").strip()
-                    detected_files += 1
-
-                    header_type = "+++" if plus_match else "--- (modified)"
-                    logger.info(f"[parse_diff] Detected via {header_type}: {new_path}")
-
-                    # Save previous file
-                    if current_file:
-                        content = "\n".join(current_lines).strip()
-
-                        if content:
-                            files[current_file] = content
-                            logger.info(f"[parse_diff]  Saved file={current_file} lines={len(current_lines)}")
-                        else:
-                            logger.warning(f"[parse_diff]  EMPTY file skipped: {current_file}")
-
-                    # Reset state
-                    current_file = None
-                    current_lines = []
-
-                    # Skip deleted file
-                    if new_path == "/dev/null":
-                        logger.info("[parse_diff]  Skipping deleted file")
+                    if new_path == "/dev/null" or not new_path.endswith(".py"):
+                        current_file = None
                         continue
-
-                    # Skip non-python
-                    if not new_path.endswith(".py"):
-                        skipped_files += 1
-                        logger.info(f"[parse_diff] ⏭ Skipping non-python: {new_path}")
-                        continue
-
+                    
                     current_file = new_path
-                    logger.info(f"[parse_diff]  Tracking file: {current_file}")
+                    current_lines = []
                     continue
 
-                # ─────────────────────────────
-                # 2. Skip metadata
-                # ─────────────────────────────
-                if (
-                    line.startswith("diff --git")
-                    or (line.startswith("--- ") and not mod_match)
-                    or line.startswith("index ")
-                    or line.startswith("@@")
-                    or line.startswith("rename ")
-                    or line.startswith("similarity ")
-                    or line.startswith("Binary files")
-                    or line.startswith("\\ No newline")
-                ):
-                    continue
-
-                # ─────────────────────────────
-                # 3. Collect content (CRITICAL FIX)
-                # ─────────────────────────────
                 if current_file is not None:
-
+                    if (line.startswith("diff --git") or line.startswith("index ") or 
+                        line.startswith("@@") or line.startswith("--- ")):
+                        continue
+                    
+                    # Reconstruction logic
                     if line.startswith("+") and not line.startswith("+++"):
                         current_lines.append(line[1:])
-
                     elif line.startswith(" "):
                         current_lines.append(line[1:])
-
                     elif not line.startswith("-"):
-                        #  FIX: handles simplified diffs (no prefix)
                         current_lines.append(line)
 
-                    # else: skip removed lines (-)
-
-            # ─────────────────────────────
-            # 4. Save last file
-            # ─────────────────────────────
-            if current_file:
-                content = "\n".join(current_lines).strip()
-
-                if content:
-                    files[current_file] = content
-                    logger.info(f"[parse_diff]  Saved final file={current_file} lines={len(current_lines)}")
-                else:
-                    logger.warning(f"[parse_diff]  Final file EMPTY: {current_file}")
-
-            # ─────────────────────────────
-            # 5. Validation + Silent Failure Detection
-            # ─────────────────────────────
-            if not files:
-                logger.error(
-                    f"[parse_diff]  NO FILES PARSED | detected={detected_files} skipped={skipped_files}"
-                )
-                logger.debug(f"[parse_diff] Full diff dump (first 1000 chars):\n{diff[:1000]}")
-                return {}
-
-            # Detect suspicious parsing
-            for fname, content in files.items():
-                if len(content.strip()) < 20:
-                    logger.warning(f"[parse_diff]  Suspicious small file: {fname} ({len(content)} chars)")
-
-            # Debug preview of output
-            for fname, content in files.items():
-                preview = content[:120].replace("\n", "\\n")
-                logger.debug(f"[parse_diff]  {fname} preview: {preview}")
-
-            logger.info(
-                f"[parse_diff]  SUCCESS extracted={len(files)} skipped={skipped_files}"
-            )
+            # Save final file
+            if current_file and current_lines:
+                files[current_file] = "\n".join(current_lines).strip()
 
             return files
-
         except Exception as e:
-            logger.exception(f"[parse_diff]  CRASH: {str(e)}")
-            raise ParseError(f"Diff parsing failed: {str(e)}", sys)
+            logger.error(f"[parse_diff] Failed to parse diff: {str(e)}")
+            raise ParseError(f"Diff parsing failed: {str(e)}")

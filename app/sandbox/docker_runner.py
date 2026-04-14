@@ -587,39 +587,33 @@ class DockerRunner:
     # ── Private: Helpers ────────────────────────────────────────────────────
 
     def _build_command(self, run_type: RunType) -> str:
-        """
-        Build the shell command string passed to the container.
+            """
+            LINT: ruff (syntax/style) then mypy (type safety).
+                Semicolon means mypy runs even if ruff finds errors.
+                Combined exit reflects mypy result.
+            TEST: ruff + mypy + pytest. 
+                Ampersand ensures tests only run on type-safe code.
+            """
+            ruff_cmd  = f"ruff check {SANDBOX_WORKDIR} --exit-zero"
+            mypy_cmd  = (
+                f"mypy {SANDBOX_WORKDIR} "
+                f"--ignore-missing-imports "
+                f"--check-untyped-defs "
+                f"--no-error-summary "
+                f"--no-pretty"
+            )
+            pytest_cmd = f"pytest {SANDBOX_WORKDIR} --timeout=10 -q"
 
-        LINT : ruff check only — fastest possible check.
-        TEST : ruff first, then pytest only if ruff passes.
-               Fail-fast principle: no point running 40 tests on code
-               that already has a syntax error on line 3.
-        """
-        ruff_cmd   = f"ruff check {SANDBOX_WORKDIR}"
-        pytest_cmd = f"pytest {SANDBOX_WORKDIR} --timeout=10 -q"
+            if run_type == RunType.LINT:
+                return f"sh -c '{ruff_cmd}; {mypy_cmd}'"
 
-        if run_type == RunType.LINT:
-            return ruff_cmd
-
-        # sh -c chains two commands inside the container shell
-        return f"sh -c '{ruff_cmd} && {pytest_cmd}'"
+            return f"sh -c '{ruff_cmd}; {mypy_cmd} && {pytest_cmd}'"
 
     @staticmethod
     def _normalize_path(path: Path) -> str:
         """
         Convert a host filesystem path to Docker volume mount format.
-
-        Linux / Mac:  /tmp/sandbox_abc  →  /tmp/sandbox_abc   (no change)
-        Windows:      E:\\Temp\\sandbox_abc  →  /e/Temp/sandbox_abc
-
-        Docker Desktop on Windows requires:
-          - drive letter lowercased and colon removed
-          - backslashes replaced with forward slashes
-          - leading forward slash added
-
-        Without this, volume mounts silently fail on Windows — the container
-        starts but /sandbox is empty, so ruff reports "no files to check"
-        and every lint passes incorrectly.
+        Crucial for Windows (E:\\ → /e/) to prevent empty volume mounts.
         """
         if platform.system() == "Windows":
             abs_path     = str(path.resolve())
@@ -627,10 +621,7 @@ class DockerRunner:
             drive_letter = drive.rstrip(":").lower()
             rest_forward = rest.replace("\\", "/")
             normalized   = f"/{drive_letter}{rest_forward}"
-            logger.info(
-                f"docker_runner: Windows path normalised — "
-                f"{abs_path} → {normalized}"
-            )
+            logger.info(f"docker_runner: Windows path normalized — {abs_path} → {normalized}")
             return normalized
 
         return str(path.resolve())

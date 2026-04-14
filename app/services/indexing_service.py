@@ -270,6 +270,7 @@ def _discover_files(repo_path: str) -> List[Tuple[str, str]]:
     before filtering logic applies.
     """
     files = []
+    skipped_count = 0
     repo_root = Path(repo_path)
     
     # --- 🟢 MANIFEST LOGGING START ---
@@ -303,6 +304,7 @@ def _discover_files(repo_path: str) -> List[Tuple[str, str]]:
         if abs_path.suffix not in FILE_EXTENSIONS:
             # Optional: Log why it's skipped if you need more detail
             # logger.debug("[indexing_service] Extension skip: %s", abs_path.name)
+            skipped_count += 1
             continue
 
         # Skip oversized files
@@ -315,6 +317,7 @@ def _discover_files(repo_path: str) -> List[Tuple[str, str]]:
                 size_kb,
                 MAX_FILE_SIZE_KB,
             )
+            skipped_count += 1
             continue
 
         relative_path = str(abs_path.relative_to(repo_root))
@@ -324,7 +327,7 @@ def _discover_files(repo_path: str) -> List[Tuple[str, str]]:
         "[indexing_service] _discover_files: %d file(s) passed filters in %s",
         len(files), repo_path,
     )
-    return files
+    return files,skipped_count
 
 
 # ── ChromaDB Helpers ──────────────────────────────────────────────────────────
@@ -588,9 +591,11 @@ async def index_repository(
             owner, repo,
         )
 
+        
         # ── Discover files ────────────────────────────────────────────────────
-        file_list = _discover_files(temp_dir)
+        file_list, discovery_skipped = _discover_files(temp_dir) # Receive the count
         result.total_files = len(file_list)
+        result.skipped_files = discovery_skipped # Assign to the final result
 
         if result.total_files == 0:
             logger.warning(

@@ -50,6 +50,7 @@ FROM python:3.11-slim
 # ---------------------------------------------------------------------------
 RUN pip install --no-cache-dir \
     ruff==0.9.0 \
+    mypy==1.15.0 \
     pytest==8.3.0 \
     pytest-timeout==2.3.1
 

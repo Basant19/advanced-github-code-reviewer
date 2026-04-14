@@ -370,51 +370,83 @@ class ChatService:
             return None
 
     # ── P5 — System Prompt Builder ────────────────────────────────────────────
-
-    def _build_system_prompt(
-        self,
-        review_ctx: Optional[Dict[str, Any]],
-        history: List[ChatResponse],
+# ── P5 — System Prompt Builder (FIXED) ────────────────────────────────────
+    async def _build_system_prompt(
+        self, 
+        thread_id: str, 
+        review_ctx: Optional[Dict[str, Any]], 
+        history: List[ChatResponse]
     ) -> str:
         """
-        Build context-aware system prompt for Gemini.
-
-        Injects review verdict, summary, and recent conversation history.
-        Summary is truncated to 800 chars to keep prompt size reasonable.
-        History is limited to last 6 messages (3 exchanges).
+        Build a structured system prompt for the chat LLM.
+        Explicitly lists all issues so the LLM cannot ignore any of them.
         """
         base = (
-            "You are an expert AI code reviewer assistant. "
-            "You help developers understand AI-generated code review findings "
-            "and answer questions about pull requests.\n\n"
-            "Be concise, specific, and reference the actual code issues "
-            "when answering. If you don't know something, say so clearly."
+            "You are an expert code review assistant. "
+            "A PR has been reviewed by an AI agent. "
+            "Answer questions about the review findings clearly and completely.\n\n"
+            "CRITICAL RULE: You MUST address ALL issues found, not just the first one. "
+            "If both a SyntaxError and a TypeError are reported, explain both.\n\n"
         )
 
         if not review_ctx:
             return base
 
-        context_block = (
-            f"\n\n--- Review Context ---\n"
-            f"Repository: {review_ctx.get('owner', '')}/{review_ctx.get('repo', 'unknown')}\n"
-            f"PR Number:  #{review_ctx.get('pr_number', '?')}\n"
-            f"Verdict:    {review_ctx.get('verdict', 'unknown')}\n"
-            f"Status:     {review_ctx.get('status', 'unknown')}\n"
-        )
+        # Extract issues from the analyze_code step for explicit injection
+        issues_text = ""
+        try:
+            from app.db.models.review_step import ReviewStep
+            from app.db.models.review import Review
+            import json
 
-        summary = review_ctx.get("summary", "")
-        if summary:
-            context_block += f"\nReview Summary:\n{summary[:800]}\n"
+            # 1. Get the Review record using the thread_id
+            result = await self.db.execute(
+                select(Review).where(Review.thread_id == thread_id)
+            )
+            review = result.scalar_one_or_none()
 
-        # Last 6 messages = last 3 exchanges
+            # 2. Get the specific analyze_code step for this review
+            if review:
+                step_result = await self.db.execute(
+                    select(ReviewStep).where(
+                        ReviewStep.review_id == review.id,
+                        ReviewStep.step_name == "analyze_code",
+                    )
+                )
+                analyze_step = step_result.scalar_one_or_none()
+
+                if analyze_step and analyze_step.output_data:
+                    raw = analyze_step.output_data
+                    parsed = json.loads(raw) if isinstance(raw, str) else raw
+                    if isinstance(parsed, list):
+                        issues_text = "\n".join(f"- {i}" for i in parsed)
+        except Exception as e:
+            logger.warning(f"[chat_service] Could not fetch explicit issues: {e}")
+
+        # Construct the final prompt string
+        prompt = base
+        
+        if issues_text:
+            prompt += f"## Issues Found (COMPLETE LIST — address all of these)\n{issues_text}\n\n"
+
+        summary = review_ctx.get("summary", "No summary available.")
+        prompt += f"## Full Review Summary\n{summary}\n\n"
+        
+        # Inject conversation history
         if history:
-            history_block = "\n--- Conversation History ---\n"
+            history_block = "--- Conversation History ---\n"
             for msg in history[-6:]:
                 role_label = "User" if msg.role == "user" else "Assistant"
                 history_block += f"{role_label}: {msg.content[:300]}\n"
-            context_block += history_block
+            prompt += history_block
 
-        return base + context_block
+        prompt += (
+            "\nWhen answering, always cover every issue in the list above. "
+            "Never summarize only the syntax error if a logic/type error is also present."
+        )
+
+        return prompt
+
 
     # ── P5 — Gemini Reply ─────────────────────────────────────────────────────
 
@@ -473,7 +505,7 @@ class ChatService:
             return wait_message
 
         # ── 4. Build system prompt ────────────────────────────────────────────
-        system_prompt = self._build_system_prompt(review_ctx, history)
+        system_prompt = await self._build_system_prompt(thread_id, review_ctx, history)
 
         # ── 5. Call Gemini ────────────────────────────────────────────────────
         try:

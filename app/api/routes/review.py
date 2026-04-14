@@ -152,11 +152,9 @@ class ReviewResponse(BaseModel):
 
 
 class ReviewDetailResponse(ReviewResponse):
-    """Full review response including steps, issues, and suggestions."""
     steps:       List[ReviewStepResponse] = []
     issues:      List[str] = []
     suggestions: List[str] = []
-
 
 class TriggerReviewResponse(BaseModel):
     """
@@ -344,15 +342,15 @@ async def list_repo_reviews(
     except Exception as e:
         _handle_service_error(e, "list_repo_reviews")
 
+
+
 @router.get(
     "/id/{review_id}",
     response_model=ReviewDetailResponse,
     summary="Get a single review with execution steps",
 )
-
-@router.get("/id/{review_id}", response_model=ReviewDetailResponse)
 async def get_review_details(
-    review_id: int = Path(..., gt=0),
+    review_id: int = Path(..., gt=0, description="Review ID"),
     db: AsyncSession = Depends(get_db),
 ) -> ReviewDetailResponse:
     logger.info("[review_route] Get review — id=%d", review_id)
@@ -360,14 +358,27 @@ async def get_review_details(
     try:
         review = await get_review(review_id, db)
 
-        issues = []
-        suggestions_list = []
+        issues: List[str] = []
+        suggestions_list: List[str] = []
 
+        parsed_steps = []
         for step in review.steps:
-            step.output_data = _safe_parse_json(step.output_data)
-            if step.step_name == "analyze_code" and isinstance(step.output_data, list):
-                issues = step.output_data
+            parsed_output = _safe_parse_json(step.output_data)
 
+            # Extract issues from analyze_code step
+            if step.step_name == "analyze_code" and isinstance(parsed_output, list):
+                issues = parsed_output
+
+            parsed_steps.append(
+                ReviewStepResponse(
+                    id=step.id,
+                    step_name=step.step_name,
+                    status=step.status,
+                    output_data=parsed_output,
+                )
+            )
+
+        # Extract suggestions from summary markdown
         summary_text = review.summary or ""
         in_suggestions = False
         for line in summary_text.splitlines():
@@ -387,15 +398,7 @@ async def get_review_details(
             verdict=review.verdict,
             summary=review.summary,
             created_at=review.created_at,
-            steps=[
-                ReviewStepResponse(
-                    id=s.id,
-                    step_name=s.step_name,
-                    status=s.status,
-                    output_data=s.output_data,
-                )
-                for s in review.steps
-            ],
+            steps=parsed_steps,
             issues=issues,
             suggestions=suggestions_list,
         )
@@ -404,7 +407,6 @@ async def get_review_details(
         raise
     except Exception as e:
         _handle_service_error(e, "get_review_details")
-
 
 
 @router.post(
