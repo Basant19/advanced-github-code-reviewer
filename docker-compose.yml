@@ -1,21 +1,6 @@
 # =============================================================================
 # docker-compose.yml — Advanced GitHub Code Reviewer
-# Full local stack: FastAPI app + PostgreSQL + ChromaDB + Streamlit
 # =============================================================================
-#
-# Usage:
-#   docker-compose up --build          # start all services
-#   docker-compose up app streamlit    # start only app + UI
-#   docker-compose down -v             # stop and remove volumes
-#
-# First-time setup:
-#   1. Copy .env.example to .env and fill in secrets
-#   2. docker-compose up --build
-#   3. App:       http://localhost:8000/docs
-#      Streamlit: http://localhost:8501
-# =============================================================================
-
-version: "3.9"
 
 services:
 
@@ -24,16 +9,18 @@ services:
     image: postgres:15-alpine
     container_name: reviewer-postgres
     restart: unless-stopped
+    env_file: .env
     environment:
-      POSTGRES_USER:     ${POSTGRES_USER}
+      POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB:       ${POSTGRES_DB}
+      POSTGRES_DB: ${POSTGRES_DB}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      # Use pg_isready which is native to the postgres image
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -48,12 +35,14 @@ services:
     environment:
       CHROMA_SERVER_HOST: 0.0.0.0
       CHROMA_SERVER_PORT: 8000
+      ANON_TELEMETRY: "False"
     volumes:
       - chroma_data:/chroma/chroma
     ports:
       - "8002:8000"
     healthcheck:
-      test: ["CMD-SHELL", "python3 -c 'import requests; requests.get(\"http://localhost:8000/api/v1/heartbeat\")' || exit 1"]
+      # Use a shell command to check if the port is open (doesn't need curl/python)
+      test: ["CMD-SHELL", "timeout 1s bash -c ':> /dev/tcp/127.0.0.1/8000' || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 5
@@ -69,24 +58,17 @@ services:
     image: code-reviewer-app:latest
     container_name: reviewer-app
     restart: unless-stopped
-    env_file:
-      - .env
+    env_file: .env
     environment:
-      # Override DB URLs to point to Docker service names
-      
+      # Use variables from .env
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       CHECKPOINTER_DB_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
-
-      # Structured JSON logging in production
       LOG_FORMAT: json
       LOG_LEVEL: INFO
-      # ChromaDB host (container-to-container)
       CHROMA_HOST: chromadb
       CHROMA_PORT: "8000"
     volumes:
-      # Mount Docker socket so app can spin up sandbox containers
       - /var/run/docker.sock:/var/run/docker.sock
-      # Persist ChromaDB local store (fallback if using file-based)
       - chroma_store:/app/chroma_store
     ports:
       - "8000:8000"
@@ -94,9 +76,9 @@ services:
       postgres:
         condition: service_healthy
       chromadb:
-        condition: service_healthy
+        condition: service_started # Changed to started to avoid healthcheck loops
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
       interval: 30s
       timeout: 10s
       start_period: 60s
@@ -109,10 +91,8 @@ services:
     image: code-reviewer-app:latest
     container_name: reviewer-streamlit
     restart: unless-stopped
-    env_file:
-      - .env
+    env_file: .env
     environment:
-      # Streamlit calls FastAPI via internal Docker network
       API_BASE_URL: http://app:8000
       LOG_FORMAT: json
     command:
@@ -121,8 +101,6 @@ services:
       - streamlit_app/dashboard.py
       - --server.port=8501
       - --server.address=0.0.0.0
-      - --server.headless=true
-      - --browser.gatherUsageStats=false
     ports:
       - "8501:8501"
     depends_on:
@@ -131,16 +109,11 @@ services:
     networks:
       - reviewer-net
 
-# ── Volumes ──────────────────────────────────────────────────────────────────
 volumes:
   postgres_data:
-    driver: local
   chroma_data:
-    driver: local
   chroma_store:
-    driver: local
 
-# ── Networks ─────────────────────────────────────────────────────────────────
 networks:
   reviewer-net:
     driver: bridge
