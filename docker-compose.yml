@@ -1,5 +1,5 @@
 # =============================================================================
-# docker-compose.yml — Advanced GitHub Code Reviewer
+# docker-compose.yml — Advanced GitHub Code Reviewer (Final Fix)
 # =============================================================================
 
 services:
@@ -19,7 +19,6 @@ services:
     ports:
       - "5432:5432"
     healthcheck:
-      # Use pg_isready which is native to the postgres image
       test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 10s
       timeout: 5s
@@ -41,7 +40,6 @@ services:
     ports:
       - "8002:8000"
     healthcheck:
-      # Use a shell command to check if the port is open (doesn't need curl/python)
       test: ["CMD-SHELL", "timeout 1s bash -c ':> /dev/tcp/127.0.0.1/8000' || exit 1"]
       interval: 15s
       timeout: 5s
@@ -60,9 +58,8 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      # Use variables from .env
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
-      CHECKPOINTER_DB_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}"
+      CHECKPOINTER_DB_URL: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}"
       LOG_FORMAT: json
       LOG_LEVEL: INFO
       CHROMA_HOST: chromadb
@@ -76,7 +73,7 @@ services:
       postgres:
         condition: service_healthy
       chromadb:
-        condition: service_started # Changed to started to avoid healthcheck loops
+        condition: service_started
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
       interval: 30s
@@ -92,15 +89,15 @@ services:
     container_name: reviewer-streamlit
     restart: unless-stopped
     env_file: .env
+    entrypoint: []
+    # We use 'python -m streamlit' to ensure the installed package is found
+    command: >
+      sh -c "python -m streamlit run streamlit_app/dashboard.py --server.port=8501 --server.address=0.0.0.0"
     environment:
       API_BASE_URL: http://app:8000
       LOG_FORMAT: json
-    command:
-      - streamlit
-      - run
-      - streamlit_app/dashboard.py
-      - --server.port=8501
-      - --server.address=0.0.0.0
+      # Ensure python doesn't buffer logs so you see them immediately
+      PYTHONUNBUFFERED: "1" 
     ports:
       - "8501:8501"
     depends_on:
