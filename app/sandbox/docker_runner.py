@@ -620,7 +620,7 @@ class DockerRunner:
             drive, rest  = os.path.splitdrive(abs_path)
             drive_letter = drive.rstrip(":").lower()
             rest_forward = rest.replace("\\", "/")
-            normalized   = f"/{drive_letter}{rest_forward}"
+            normalized = f"//{drive_letter}{rest_forward}"
             logger.info(f"docker_runner: Windows path normalized — {abs_path} → {normalized}")
             return normalized
 
