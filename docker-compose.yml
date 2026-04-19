@@ -64,9 +64,13 @@ services:
       LOG_LEVEL: INFO
       CHROMA_HOST: chromadb
       CHROMA_PORT: "8000"
+      # --- SANDBOX CONFIGURATION ---
+      SANDBOX_TMP_DIR: /sandbox_tmp
+      SANDBOX_VOLUME_NAME: advanced-github-code-reviewer_sandbox_tmp
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - chroma_store:/app/chroma_store
+      - sandbox_tmp:/sandbox_tmp  # Mounted so App can write review files
     ports:
       - "8000:8000"
     depends_on:
@@ -90,13 +94,11 @@ services:
     restart: unless-stopped
     env_file: .env
     entrypoint: []
-    # We use 'python -m streamlit' to ensure the installed package is found
     command: >
       sh -c "python -m streamlit run streamlit_app/dashboard.py --server.port=8501 --server.address=0.0.0.0"
     environment:
       API_BASE_URL: http://app:8000
       LOG_FORMAT: json
-      # Ensure python doesn't buffer logs so you see them immediately
       PYTHONUNBUFFERED: "1" 
     ports:
       - "8501:8501"
@@ -106,10 +108,14 @@ services:
     networks:
       - reviewer-net
 
+# ── Shared Storage ────────────────────────────────────────────────────────────
 volumes:
   postgres_data:
   chroma_data:
   chroma_store:
+  # The named volume used to pass code from App container to Sandbox container
+  sandbox_tmp:
+    name: advanced-github-code-reviewer_sandbox_tmp
 
 networks:
   reviewer-net:
