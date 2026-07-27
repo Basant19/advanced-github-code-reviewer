@@ -1,3 +1,13 @@
+![maindashboard](maindashboard.png)
+
+
+
+![reviewchat](reviewchat.png)
+
+
+
+![reviewdetail](reviewdetail.png)
+
 #fast api ui 
 python run.py
 http://localhost:8000/docs
@@ -75,4 +85,5 @@ open two terminal and use this command  per terminal
 front end : streamlit run streamlit_app/dashboard.py
 backend : python run.py
 
+------------------------------------------------------------------------------------------------------------------
 
