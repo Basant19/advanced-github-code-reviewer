@@ -67,7 +67,12 @@ Why: Verifies the chat history persistence layer works accurately.
 ----------------------------------------------------------------------------------------------
 
 #run complete project 
+get llm token 
+get github token 
+get github secret use this command python -c "import secrets; print(secrets.token_hex(32))" in this terminal 
+run docker desktop 
 open two terminal and use this command  per terminal 
 front end : streamlit run streamlit_app/dashboard.py
 backend : python run.py
+
 

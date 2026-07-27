@@ -640,7 +640,7 @@ async def fetch_diff_node(state: ReviewState) -> Dict:
     Also performs a 'baseline' lint check on the original files to isolate pre-existing bugs.
     """
     # Small delay for UI/logging pacing
-    await asyncio.sleep(2)
+    await asyncio.sleep(3)
     owner, repo, pr_number = state["owner"], state["repo"], state["pr_number"]
 
     try:
@@ -719,7 +719,7 @@ async def retrieve_context_node(state: ReviewState) -> Dict:
     Query ChromaDB for relevant codebase context.
     RAG is optional; failures here should NEVER stop the workflow.
     """
-    await asyncio.sleep(2)
+    await asyncio.sleep(3)
     
     # Check for systemic infrastructure failure only
     if state.get("critical_infra_failure"):
