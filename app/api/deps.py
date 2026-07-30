@@ -20,7 +20,7 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
     Commit is called only if the route completes without raising.
     CustomException propagates untouched so route error handlers see
     the original message and status code.
-    Only unexpected infrastructure errors are re-wrapped.
+    Only unexpected infrastructure errors are re-wrapped
     """
     async with AsyncSessionLocal() as session:
         try:
