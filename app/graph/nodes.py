@@ -76,7 +76,7 @@ Async Safety
 ------------
 LLM_SEMAPHORE limits concurrent Gemini calls to 1 (free tier safe).
 LLM_TIMEOUT enforces a hard 30-second ceiling per call.
-A 2-second cooldown after each successful call prevents RPM burst.
+A 5-second cooldown after each successful call prevents RPM burst.
 
 Patching in Tests
 -----------------
@@ -862,7 +862,7 @@ async def analyze_code_node(state: ReviewState) -> Dict:
                 f"PR Title: {pr_title}\n"
                 f"{repo_context}\n"
                 f"{base_context}\n"
-                f"\n--- PR DIFF ('+' lines are new, '-' lines are removed) ---\n{diff}"
+                f"\n--- PR DIFF ('+' lines are new, '-' lines are removed) ---\n{diff[:MAX_DIFF_CHARS]}"
             )),
         ]
 
@@ -1126,8 +1126,16 @@ async def validator_node(state: ReviewState) -> Dict:
     # 2. Get Sandbox Instance
     sandbox = get_sandbox()
     if not sandbox:
-        logger.warning("[validator_node] Sandbox unavailable — failsafe: marking as passed")
-        return {"validation_passed": True, "validation_result": "SKIPPED_NO_SANDBOX"}
+        # FIX: Previously failed open (validation_passed=True), silently treating
+        # an untested patch as validated. Now matches lint_node's fail-closed
+        # pattern — a human must see that validation never actually ran.
+        logger.error("[validator_node] Sandbox unavailable — infrastructure failure")
+        return {
+            "validation_passed": False,
+            "validation_result": "FAILED_INFRASTRUCTURE",
+            "critical_infra_failure": True,
+            "error_reason": "SANDBOX_UNAVAILABLE",
+        }
 
     try:
         # 3. Execute Sandbox Tests
@@ -1167,10 +1175,16 @@ async def validator_node(state: ReviewState) -> Dict:
             }
             
     except Exception as e:
+        # FIX: Previously failed open (validation_passed=True) on a genuine
+        # sandbox crash — identical failure to lint_node's crash path, but
+        # handled oppositely. Now fails closed so a human sees the patch
+        # was never actually verified, instead of it looking like a real pass.
         logger.exception("[validator_node] Sandbox runtime error: %s", str(e))
         return {
-            "validation_passed": True, 
-            "validation_result": {"error": str(e), "status": "SKIPPED_SANDBOX_ERROR"}
+            "validation_passed": False,
+            "validation_result": {"error": str(e), "status": "SANDBOX_RUNTIME_CRASH"},
+            "critical_infra_failure": True,
+            "error_reason": "SANDBOX_RUNTIME_CRASH",
         }
 
 
