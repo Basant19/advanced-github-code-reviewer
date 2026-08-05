@@ -744,7 +744,7 @@ async def decide_review(
 
         # ── 5. Persist Results & Metadata ─────────────────────────────────────
         review.verdict = final_state.get("verdict", "UNKNOWN")
-        review.summary = final_state.get("summary", "")
+        
         review.status = "completed" if decision == "approved" else "rejected"
 
         # Save verdict/summary steps to DB
@@ -754,14 +754,16 @@ async def decide_review(
             logger.warning("[decide_review] Step persistence failed, continuing...", exc_info=True)
 
         # ── 6. Post to GitHub ─────────────────────────────────────────────────
-        if review.verdict != "HUMAN_REJECTED" and review.summary:
+
+        github_text = final_state.get("github_comment", "")
+        if review.verdict != "HUMAN_REJECTED" and github_text:
             try:
                 pr = review.pull_request
                 repo = pr.repository
                 
                 gh = GitHubClient()
                 gh.post_review_comment(
-                    repo.owner, repo.name, pr.pr_number, review.summary
+                    repo.owner, repo.name, pr.pr_number, github_text
                 )
                 logger.info("[decide_review] GitHub comment posted for PR #%d", pr.pr_number)
             except Exception:

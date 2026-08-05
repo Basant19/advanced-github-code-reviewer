@@ -122,7 +122,7 @@ class ReviewState(TypedDict, total=False):
     # ── FINAL OUTPUT ──────────────────────────────────────────────────────────
     verdict: str  
     summary: str  
-
+    github_comment: str
 
 # ── Initial State Builder ─────────────────────────────────────────────────────
 

@@ -1379,7 +1379,10 @@ async def verdict_node(state: ReviewState) -> Dict:
         logger.warning("[verdict_node] Infrastructure Failure — reason=%s", reason)
         return {
             "verdict": "FAILED",
-            "summary": (
+            # FIX: write to github_comment, not summary — summary stays as
+            # summary_node's HITL briefing, permanently, for the whole
+            # review's life. Nothing after this point ever overwrites it.
+            "github_comment": (
                 f"## ❌ System Error\n\n"
                 f"The review pipeline encountered a technical failure: `{reason}`.\n"
                 f"The AI results could not be verified by the sandbox."
@@ -1389,7 +1392,8 @@ async def verdict_node(state: ReviewState) -> Dict:
     if human_decision == "rejected":
         return {
             "verdict": "HUMAN_REJECTED",
-            "summary": f"## ❌ Review Rejected by Human Reviewer\n\nPR: {pr_title}"
+            # FIX: github_comment, not summary — see comment above.
+            "github_comment": f"## ❌ Review Rejected by Human Reviewer\n\nPR: {pr_title}"
         }
 
     # If code has issues OR lint failed, we REQUEST_CHANGES
@@ -1443,5 +1447,11 @@ async def verdict_node(state: ReviewState) -> Dict:
 
     return {
         "verdict": verdict,
-        "summary": summary,
+        # FIX: github_comment, not summary. review.summary — synced from
+        # summary_node while the review sat at pending_hitl — is left
+        # untouched, so chat_service.py and any other reader of
+        # review.summary sees the same document before and after the
+        # human's decision. This markdown is specifically what gets
+        # posted to GitHub, nothing more.
+        "github_comment": summary,
     }
