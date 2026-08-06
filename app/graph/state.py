@@ -191,6 +191,7 @@ def build_initial_state(
 
             "verdict": "",
             "summary": "",
+            "github_comment": "",
         }
 
         return state
