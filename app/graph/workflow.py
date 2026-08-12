@@ -61,14 +61,24 @@ def should_reflect(state: ReviewState) -> str:
 
 def should_lint_refactor(state: ReviewState) -> str:
     """
-    Route after linting. Failures in code logic proceed to summary,
-    while infrastructure crashes route to HITL.
+    Route after linting. Failures in code logic proceed to refactor_node
+    so a corrective patch can be attempted, while infrastructure crashes
+    route to HITL.
     """
     if state.get("critical_infra_failure"):
         logger.error("[workflow] should_lint_refactor: Sandbox Crash — routing to hitl_node")
         return "hitl_node"
 
-    # Even if lint_passed is False, we move to memory_write to report the findings
+    # FIX: A real lint failure (lint_passed=False) must route to refactor_node
+    # so the bounded generate-patch-and-validate loop actually runs. Previously
+    # this function only ever returned "hitl_node" or "memory_write_node" —
+    # "refactor_node" was a valid, wired conditional-edge target that this
+    # function could never produce, making refactor_node and validator_node
+    # structurally unreachable regardless of lint outcome.
+    if not state.get("lint_passed", True):
+        logger.info("[workflow] should_lint_refactor: Lint failed — routing to refactor_node")
+        return "refactor_node"
+
     return "memory_write_node"
 
 

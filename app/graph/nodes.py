@@ -711,7 +711,16 @@ async def fetch_diff_node(state: ReviewState) -> Dict:
 
     except Exception as e:
         logger.exception("[fetch_diff_node] Failed")
-        return {"error": True, "error_reason": str(e)}
+        # FIX: A failed GitHubClient() construction or a failed metadata/diff
+        # fetch means there is NO real data anywhere in state for this review —
+        # not a code-quality finding. This must escalate as an infrastructure
+        # failure (matching lint_node/validator_node's established pattern),
+        # not a soft "error" that lets the graph continue analyzing empty data.
+        return {
+            "error": True,
+            "error_reason": str(e),
+            "critical_infra_failure": True,
+        }
 
 @traceable(name="retrieve_context_node", tags=["chromadb", "rag", "p4"])
 async def retrieve_context_node(state: ReviewState) -> Dict:

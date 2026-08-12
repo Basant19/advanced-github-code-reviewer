@@ -54,7 +54,14 @@ class SandboxClient:
             files = self._parse_diff(diff)
             if not files:
                 logger.warning("sandbox_client: No files extracted from diff, skipping sandbox.")
-                return SandboxResult(passed=True, output="No python files to lint", tool="lint")
+                return SandboxResult(
+                    passed=True,
+                    output="No python files to lint",
+                    errors="",
+                    exit_code=0,
+                    duration_ms=0,
+                    tool="lint",
+                )
 
             # 2. Log payload for observability
             self._log_payload(files, "LINT")
@@ -78,6 +85,7 @@ class SandboxClient:
                 output="", 
                 errors=f"Sandbox execution failed: {str(exc)}",
                 exit_code=1,
+                duration_ms=0,
                 tool="lint"
             )
 
@@ -98,6 +106,7 @@ class SandboxClient:
                 output="",
                 errors=f"Baseline check failed: {str(exc)}",
                 exit_code=1,
+                duration_ms=0,
                 tool="lint",
             )
 
@@ -112,7 +121,14 @@ class SandboxClient:
             return result
         except Exception as exc:
             logger.exception("sandbox_client: run_tests failed")
-            return SandboxResult(passed=False, errors=str(exc), tool="test")
+            return SandboxResult(
+                passed=False,
+                output="",
+                errors=str(exc),
+                exit_code=1,
+                duration_ms=0,
+                tool="test",
+            )
 
     def is_available(self) -> bool:
         return self._runner.is_available()
